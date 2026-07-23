@@ -281,6 +281,12 @@ class NCC_vxm(torch.nn.Module):
         self.win = win
 
     def forward(self, y_true, y_pred):
+        # Local sums are subsequently squared. For a 9^3 window those values
+        # can exceed float16's finite range even when normalized images and
+        # model activations are finite. Keep LNCC in float32 under AMP.
+        if y_true.is_cuda and torch.is_autocast_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                return self.forward(y_true.float(), y_pred.float())
 
         Ii = y_true
         Ji = y_pred
