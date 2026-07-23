@@ -222,7 +222,11 @@ class SACB(nn.Module):
             # Clustering is numerically fragile in float16 and does not need
             # autocast savings. Keeping its input in float32 makes AMP usable
             # on A100 while centroids are cast back for the learned heads.
-            cluster_idx, centroid = self.km.get_cluster_map(x_mean[batch_idx].float())
+            if x.is_cuda:
+                with torch.cuda.amp.autocast(enabled=False):
+                    cluster_idx, centroid = self.km.get_cluster_map(x_mean[batch_idx].float())
+            else:
+                cluster_idx, centroid = self.km.get_cluster_map(x_mean[batch_idx].float())
             if not torch.is_tensor(cluster_idx):
                 cluster_idx = torch.as_tensor(cluster_idx, device=x.device)
             else:
