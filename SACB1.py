@@ -241,12 +241,17 @@ class SACB(nn.Module):
                     conditioned_centroid = conditioned_centroid + self.cond_proj(cond_centroid)
                 weight = rearrange(self.get_kernel(conditioned_centroid), 'b k -> b 1 1 k') * self.w
                 bias = rearrange(self.get_bias(conditioned_centroid), 'b o -> b o 1')
-                response = torch.einsum(
-                    'b i j, b o i -> b o j',
-                    x[batch_idx:batch_idx+1],
-                    rearrange(weight, 'b o i k -> b o (i k)'),
-                ) + bias
-                out[batch_idx:batch_idx+1] = out[batch_idx:batch_idx+1] + response * rearrange(mask, 's -> 1 1 s').to(x.dtype)
+                # Each voxel belongs to exactly one KMeans cluster. The
+                # original implementation evaluated every cluster-specific
+                # convolution at every voxel and masked most responses only
+                # afterwards, multiplying SACB compute by ``num_k``. Selecting
+                # the cluster's patches first is algebraically identical and
+                # keeps parameter/checkpoint shapes unchanged.
+                selected_patches = x[batch_idx, :, mask]
+                kernel = rearrange(weight, 'b o i k -> b o (i k)')[0]
+                response = torch.einsum('o i, i s -> o s', kernel, selected_patches)
+                response = response + bias[0]
+                out[batch_idx, :, mask] = response
            
         out = rearrange(out, 'b o (d h w) -> b o d h w', d=d, h=h, w=w)
         if self.act: out = self.act(out)
