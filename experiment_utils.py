@@ -118,6 +118,8 @@ def build_model(config: Mapping[str, object]) -> GAM_SACB_Net:
         context_ch=int(model.get("context_channels", 11)),
         fusion_hidden_ch=int(model.get("fusion_hidden_channels", 64)),
         fix_kmeans_rng=bool(model.get("fix_kmeans_rng", True)),
+        kmeans_max_iter=int(model.get("kmeans_max_iter", 20)),
+        kmeans_tolerance=float(model.get("kmeans_tolerance", 1.0e-4)),
     )
 
 

@@ -43,6 +43,8 @@ class GAM_SACB_Net(nn.Module):
         context_ch: int = 11,
         fusion_hidden_ch: int = 64,
         fix_kmeans_rng: bool = True,
+        kmeans_max_iter: int = 20,
+        kmeans_tolerance: float = 1.0e-4,
     ) -> None:
         super().__init__()
         self.inshape = tuple(int(v) for v in inshape)
@@ -52,6 +54,8 @@ class GAM_SACB_Net(nn.Module):
         self.scale = float(scale)
         self.mt = mean_type
         self.context_ch = int(context_ch)
+        if int(kmeans_max_iter) <= 0 or float(kmeans_tolerance) <= 0.0:
+            raise ValueError("KMeans iterations and tolerance must be positive")
         c = self.ch_scale
         self.num_k = tuple_(num_k, length=4) if not isinstance(num_k, tuple) else num_k
         if len(self.num_k) != 4:
@@ -63,7 +67,14 @@ class GAM_SACB_Net(nn.Module):
         self.up_tri = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=True)
         self.conv1 = double_conv(2 * c, 2 * c, act=act)
         self.cross_sim = cross_Sim()
-        sacb_common = {"act": act, "residual": True, "cond_ch": context_ch, "fix_rng": bool(fix_kmeans_rng)}
+        sacb_common = {
+            "act": act,
+            "residual": True,
+            "cond_ch": context_ch,
+            "fix_rng": bool(fix_kmeans_rng),
+            "m_iter": int(kmeans_max_iter),
+            "tol": float(kmeans_tolerance),
+        }
         self.sacb_proj2 = SACB(4 * c, 4 * c, in_proj_n=1, ks=3, mean_type=self.mt, num_k=self.num_k[0], **sacb_common)
         self.sacb_proj3 = SACB(8 * c, 8 * c, in_proj_n=1, ks=3, mean_type=self.mt, num_k=self.num_k[1], **sacb_common)
         self.sacb_proj4 = SACB(16 * c, 16 * c, in_proj_n=1, ks=3, mean_type=self.mt, num_k=self.num_k[2], **sacb_common)
