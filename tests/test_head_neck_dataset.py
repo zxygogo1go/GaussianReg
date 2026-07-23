@@ -6,10 +6,23 @@ from pathlib import Path
 import numpy as np
 
 from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256, read_manifest
-from prepare_hntsmrg24 import _stratified_split, robust_normalize
+from prepare_hntsmrg24 import _as_euler3d, _stratified_split, robust_normalize
 
 
 class HeadNeckDatasetTests(unittest.TestCase):
+    def test_generic_simpleitk_transform_is_cast_back_to_euler3d(self):
+        try:
+            import SimpleITK as sitk
+        except ImportError:
+            self.skipTest("SimpleITK is unavailable")
+        concrete = sitk.Euler3DTransform()
+        concrete.SetCenter((1.0, 2.0, 3.0))
+        generic = sitk.Transform(concrete)
+        self.assertFalse(hasattr(generic, "GetCenter"))
+        recovered = _as_euler3d(generic)
+        self.assertEqual(recovered.GetName(), "Euler3DTransform")
+        self.assertEqual(tuple(recovered.GetCenter()), (1.0, 2.0, 3.0))
+
     def test_manifest_loading_shapes_and_response_flags(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

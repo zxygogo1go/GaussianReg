@@ -112,6 +112,27 @@ def _registration_method(iterations: int, seed: int, sampling: float, learning_r
     return method
 
 
+def _as_euler3d(transform):
+    """Recover the concrete Euler3D API from a generic SimpleITK transform.
+
+    SimpleITK 2.3 may expose ``CenteredTransformInitializer`` results as the
+    base ``Transform`` wrapper even though the underlying transform is
+    Euler3D. Newer releases preserve the concrete Python type. Explicit
+    down-casting keeps both versions compatible and makes ``GetCenter`` /
+    ``GetMatrix`` / ``GetTranslation`` available.
+    """
+    sitk = _sitk()
+    if transform.GetDimension() != 3:
+        raise ValueError("rigid initializer must return a 3D transform")
+    try:
+        return sitk.Euler3DTransform(transform)
+    except RuntimeError as exc:
+        raise TypeError(
+            "rigid initializer returned an incompatible transform: %s"
+            % transform.GetName()
+        ) from exc
+
+
 def _rigid_affine_prealign(case: HNTSCase, seed: int, iterations: int):
     sitk = _sitk()
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
@@ -125,11 +146,13 @@ def _rigid_affine_prealign(case: HNTSCase, seed: int, iterations: int):
     fixed_metric = sitk.Normalize(fixed)
     moving_metric = sitk.Normalize(moving)
     sampling = min(1.0, max(0.02, 10000.0 / float(fixed.GetNumberOfPixels())))
-    rigid = sitk.CenteredTransformInitializer(
-        fixed_metric,
-        moving_metric,
-        sitk.Euler3DTransform(),
-        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    rigid = _as_euler3d(
+        sitk.CenteredTransformInitializer(
+            fixed_metric,
+            moving_metric,
+            sitk.Euler3DTransform(),
+            sitk.CenteredTransformInitializerFilter.GEOMETRY,
+        )
     )
     rigid_method = _registration_method(iterations, seed, sampling, learning_rate=2.0)
     rigid_method.SetInitialTransform(rigid, inPlace=True)
