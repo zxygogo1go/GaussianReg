@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "experiment_name": "gam_sacb_hntsmrg24",
+  "seed": 2026,
+  "data": {
+    "cohort": "HNTS-MRG24 longitudinal T2",
+    "shape_dhw": [128, 160, 160],
+    "spacing_dhw": [1.5, 1.5, 1.5],
+    "moving_timepoint": "raw preRT after rigid/affine prealignment",
+    "fixed_timepoint": "midRT",
+    "labels_for_training": false
+  },
+  "model": {
+    "in_channels": 1,
+    "channel_scale": 4,
+    "num_k": [7, 7, 7, 7],
+    "fix_kmeans_rng": true,
+    "mean_type": "s",
+    "scale": 1.0,
+    "token_dim": 64,
+    "token_num_l5": 128,
+    "token_num_l4": 192,
+    "num_types": 8,
+    "context_channels": 11,
+    "fusion_hidden_channels": 64
+  },
+  "loss": {
+    "similarity": 1.0,
+    "smoothness": 0.3,
+    "deep_similarity": 1.0,
+    "token": 0.01,
+    "transport": 0.02,
+    "anchor": 0.05,
+    "ncc_window": 9,
+    "deep_ncc_window": 5,
+    "deep_scale_weights": {
+      "phi4_native": 0.05,
+      "phi3_native": 0.1,
+      "phi2_native": 0.15
+    },
+    "token_repulsion_scale": 0.08
+  },
+  "optimization": {
+    "epochs": 500,
+    "batch_size": 1,
+    "workers": 4,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.00001,
+    "warmup_epochs": 5,
+    "minimum_lr_factor": 0.05,
+    "gradient_clip": 5.0,
+    "amp": true,
+    "allow_tf32": true,
+    "validate_every": 1,
+    "checkpoint_every": 25,
+    "log_every": 10
+  }
+}

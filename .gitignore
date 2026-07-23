@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runs/
+results/
+task_plan.md
+findings.md
+progress.md
+
+venv/
+.idea/
+原论文.pdf
