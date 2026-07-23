@@ -88,11 +88,26 @@ def cuda_autocast(enabled: bool):
     return torch.cuda.amp.autocast(enabled=bool(enabled))
 
 
-def make_grad_scaler(enabled: bool):
+def make_grad_scaler(
+    enabled: bool,
+    initial_scale: float = 1024.0,
+    growth_interval: int = 2000,
+):
     """Version-compatible GradScaler for the original PyTorch 1.13 pin."""
+    if initial_scale <= 0.0 or growth_interval <= 0:
+        raise ValueError("GradScaler initial scale and growth interval must be positive")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        return torch.amp.GradScaler("cuda", enabled=bool(enabled))
-    return torch.cuda.amp.GradScaler(enabled=bool(enabled))
+        return torch.amp.GradScaler(
+            "cuda",
+            init_scale=float(initial_scale),
+            growth_interval=int(growth_interval),
+            enabled=bool(enabled),
+        )
+    return torch.cuda.amp.GradScaler(
+        init_scale=float(initial_scale),
+        growth_interval=int(growth_interval),
+        enabled=bool(enabled),
+    )
 
 
 def build_model(config: Mapping[str, object]) -> GAM_SACB_Net:

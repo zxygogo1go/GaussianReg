@@ -94,6 +94,7 @@ def _train_epoch(
     model.train()
     totals = defaultdict(float)
     sample_count = 0
+    successful_steps = 0
     start = time.perf_counter()
     for step, sample in enumerate(loader, start=1):
         moving = sample["moving"].to(device, non_blocking=True)
@@ -108,9 +109,36 @@ def _train_epoch(
         scaler.unscale_(optimizer)
         gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(gradient_clip))
         if not bool(torch.isfinite(torch.as_tensor(gradient_norm)).detach()):
-            raise FloatingPointError("non-finite gradient norm for patients %s" % list(sample["patient_id"]))
+            if not amp:
+                raise FloatingPointError("non-finite gradient norm for patients %s" % list(sample["patient_id"]))
+            previous_scale = float(scaler.get_scale())
+            # ``unscale_`` has already recorded the non-finite gradients.
+            # GradScaler.step therefore skips the optimizer update, and
+            # update lowers the scale for the next sample.
+            scaler.step(optimizer)
+            scaler.update()
+            new_scale = float(scaler.get_scale())
+            count = int(moving.shape[0])
+            sample_count += count
+            for name, value in terms.items():
+                totals[name] += float(value.detach().float().cpu()) * count
+            for name, value in output_diagnostics(output).items():
+                totals[name] += float(value) * count
+            totals["skipped_amp_steps"] += count
+            print(
+                "epoch %d step %d/%d AMP overflow scale %.1f -> %.1f; optimizer step skipped"
+                % (epoch, step, len(loader), previous_scale, new_scale)
+            )
+            if new_scale >= previous_scale or previous_scale <= 1.0:
+                raise FloatingPointError(
+                    "AMP could not recover non-finite gradients for patients %s"
+                    % list(sample["patient_id"])
+                )
+            optimizer.zero_grad(set_to_none=True)
+            continue
         scaler.step(optimizer)
         scaler.update()
+        successful_steps += 1
 
         count = int(moving.shape[0])
         sample_count += count
@@ -131,6 +159,8 @@ def _train_epoch(
                     totals["similarity"] / sample_count,
                 )
             )
+    if successful_steps == 0:
+        raise FloatingPointError("all optimizer steps in the epoch were skipped")
     result = {name: value / max(sample_count, 1) for name, value in totals.items()}
     result["seconds"] = time.perf_counter() - start
     return result
@@ -298,7 +328,11 @@ def main() -> None:
         lr_lambda=lambda epoch: learning_rate_factor(epoch, epochs, warmup_epochs, minimum_lr_factor),
     )
     amp = bool(optimization.get("amp", True)) and device.type == "cuda"
-    scaler = make_grad_scaler(amp)
+    scaler = make_grad_scaler(
+        amp,
+        initial_scale=float(optimization.get("amp_initial_scale", 1024.0)),
+        growth_interval=int(optimization.get("amp_growth_interval", 2000)),
+    )
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(optimization.get("allow_tf32", True))
         torch.backends.cudnn.allow_tf32 = bool(optimization.get("allow_tf32", True))
