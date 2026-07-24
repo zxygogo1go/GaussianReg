@@ -15,9 +15,10 @@ from torch.utils.data import DataLoader
 
 from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256
 from experiment_utils import (
-    RegistrationObjective,
     atomic_torch_save,
     build_model,
+    build_objective,
+    config_architecture,
     cuda_autocast,
     finite_mean,
     learning_rate_factor,
@@ -81,7 +82,7 @@ def _make_loader(
 
 def _train_epoch(
     model: torch.nn.Module,
-    objective: RegistrationObjective,
+    objective: torch.nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: torch.cuda.amp.GradScaler,
@@ -169,7 +170,7 @@ def _train_epoch(
 @torch.inference_mode()
 def _validate(
     model: torch.nn.Module,
-    objective: RegistrationObjective,
+    objective: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     amp: bool,
@@ -245,8 +246,13 @@ def _checkpoint(
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(expected_architecture: str = "gam_sacb") -> None:
+    description = (
+        "Train the original SACB-Net baseline on preprocessed HNTS-MRG24 longitudinal pairs."
+        if expected_architecture == "sacb"
+        else __doc__
+    )
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", required=True, help="JSON experiment config")
     parser.add_argument("--data-root", required=True, help="preprocessed dataset root")
     parser.add_argument("--train-manifest", required=True)
@@ -260,6 +266,14 @@ def main() -> None:
     if args.resume and args.baseline_checkpoint:
         raise ValueError("--resume and --baseline-checkpoint are mutually exclusive")
     config = load_json(args.config)
+    architecture = config_architecture(config)
+    if architecture != expected_architecture:
+        raise ValueError(
+            "this entry point requires model.architecture=%s, got %s"
+            % (expected_architecture, architecture)
+        )
+    if args.baseline_checkpoint and architecture != "gam_sacb":
+        raise ValueError("--baseline-checkpoint initializes GAM-SACB-Net only")
     output_dir = Path(args.output_dir)
     if output_dir.exists():
         if not output_dir.is_dir():
@@ -272,7 +286,6 @@ def main() -> None:
     device = resolve_device(args.device)
     optimization = dict(config.get("optimization", {}))
     data_config = dict(config.get("data", {}))
-    loss_config = dict(config.get("loss", {}))
     shape = tuple(int(value) for value in data_config.get("shape_dhw", (128, 160, 160)))
     train_dataset = HeadNeckRegistrationDataset(
         args.train_manifest,
@@ -308,13 +321,15 @@ def main() -> None:
     )
 
     model = build_model(config).to(device)
+    trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    print("architecture=%s trainable_parameters=%d" % (architecture, trainable_parameters))
     if args.baseline_checkpoint:
         incompatible = model.load_sacb_checkpoint(args.baseline_checkpoint)
         print(
             "loaded baseline checkpoint: %d new keys missing, %d unexpected keys"
             % (len(incompatible.missing_keys), len(incompatible.unexpected_keys))
         )
-    objective = RegistrationObjective(loss_config).to(device)
+    objective = build_objective(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(optimization.get("learning_rate", 1.0e-4)),
@@ -355,6 +370,8 @@ def main() -> None:
             "train_manifest": str(Path(args.train_manifest).resolve()),
             "validation_manifest": str(Path(args.validation_manifest).resolve()),
             "device": str(device),
+            "architecture": architecture,
+            "trainable_parameters": int(trainable_parameters),
             "manifest_sha256": manifests,
         },
     }

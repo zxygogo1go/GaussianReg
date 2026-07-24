@@ -7,7 +7,7 @@ import csv
 import json
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256
 from experiment_utils import (
     bootstrap_mean_ci,
     build_model,
+    config_architecture,
     cuda_autocast,
     load_json,
     resolve_device,
@@ -139,8 +140,13 @@ def _write_csv(path: Path, records: Sequence[Mapping[str, object]]) -> None:
 
 
 @torch.inference_mode()
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(expected_architecture: Optional[str] = None) -> None:
+    description = (
+        "Evaluate an original SACB-Net checkpoint on patient-disjoint HNTS-MRG24 pairs."
+        if expected_architecture == "sacb"
+        else __doc__
+    )
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default=None, help="required only for a raw state_dict checkpoint")
     parser.add_argument("--data-root", required=True)
@@ -166,6 +172,12 @@ def main() -> None:
     config = load_json(args.config) if args.config else checkpoint_config
     if not isinstance(config, dict):
         raise ValueError("checkpoint has no config; provide --config")
+    architecture = config_architecture(config)
+    if expected_architecture is not None and architecture != expected_architecture:
+        raise ValueError(
+            "this entry point requires model.architecture=%s, got %s"
+            % (expected_architecture, architecture)
+        )
     seed = int(config.get("seed", 2026))
     set_reproducibility(seed)
     device = resolve_device(args.device)
@@ -283,6 +295,7 @@ def main() -> None:
 
     summary = _summarize(records, seed=seed, bootstrap_samples=int(args.bootstrap_samples))
     result = {
+        "architecture": architecture,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "manifest": str(Path(args.manifest).resolve()),
         "manifest_sha256": manifest_sha256(args.manifest),

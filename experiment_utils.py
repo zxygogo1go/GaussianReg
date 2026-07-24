@@ -21,6 +21,7 @@ from losses import (
     NCC_vxm,
     TransportCostLoss,
 )
+from model import SACB_Net
 from model_gam import GAM_SACB_Net
 
 
@@ -110,7 +111,59 @@ def make_grad_scaler(
     )
 
 
-def build_model(config: Mapping[str, object]) -> GAM_SACB_Net:
+class BaselineSACBNet(SACB_Net):
+    """Training-interface adapter around the unchanged SACB-Net architecture."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        softsign_last: bool = False,
+        return_aux: bool = False,
+    ):
+        warped, flow = super().forward(x, y, softsign_last=softsign_last)
+        if return_aux:
+            return {"warped": warped, "flow": flow}
+        return warped, flow
+
+
+def config_architecture(config: Mapping[str, object]) -> str:
+    """Return the canonical architecture name stored in an experiment config."""
+    model = dict(config.get("model", {}))
+    architecture = str(model.get("architecture", "gam_sacb")).strip().lower().replace("-", "_")
+    aliases = {
+        "gam": "gam_sacb",
+        "gam_sacb": "gam_sacb",
+        "gam_sacb_net": "gam_sacb",
+        "sacb": "sacb",
+        "sacb_net": "sacb",
+        "baseline_sacb": "sacb",
+    }
+    if architecture not in aliases:
+        raise ValueError("unsupported model.architecture: %s" % architecture)
+    return aliases[architecture]
+
+
+def _configure_sacb_kmeans(
+    model: nn.Module,
+    fix_rng: bool,
+    max_iter: int,
+    tolerance: float,
+) -> None:
+    """Apply the same deterministic KMeans runtime policy to either architecture."""
+    if max_iter <= 0 or tolerance <= 0.0:
+        raise ValueError("KMeans iterations and tolerance must be positive")
+    for module in model.modules():
+        km_wrapper = getattr(module, "km", None)
+        kmeans = getattr(km_wrapper, "km", None)
+        if kmeans is None:
+            continue
+        km_wrapper.fix_rng = bool(fix_rng)
+        kmeans.max_iter = int(max_iter)
+        kmeans.tolerance = float(tolerance)
+
+
+def build_model(config: Mapping[str, object]) -> nn.Module:
     data = dict(config.get("data", {}))
     model = dict(config.get("model", {}))
     shape = tuple(int(v) for v in data.get("shape_dhw", (128, 160, 160)))
@@ -119,13 +172,26 @@ def build_model(config: Mapping[str, object]) -> GAM_SACB_Net:
     num_k = model.get("num_k", 7)
     if isinstance(num_k, list):
         num_k = tuple(int(value) for value in num_k)
+    common = {
+        "inshape": shape,
+        "in_c": int(model.get("in_channels", 1)),
+        "ch_scale": int(model.get("channel_scale", 4)),
+        "num_k": num_k,
+        "scale": float(model.get("scale", 1.0)),
+        "mean_type": str(model.get("mean_type", "s")),
+    }
+    architecture = config_architecture(config)
+    if architecture == "sacb":
+        baseline = BaselineSACBNet(**common)
+        _configure_sacb_kmeans(
+            baseline,
+            fix_rng=bool(model.get("fix_kmeans_rng", True)),
+            max_iter=int(model.get("kmeans_max_iter", 20)),
+            tolerance=float(model.get("kmeans_tolerance", 1.0e-4)),
+        )
+        return baseline
     return GAM_SACB_Net(
-        inshape=shape,
-        in_c=int(model.get("in_channels", 1)),
-        ch_scale=int(model.get("channel_scale", 4)),
-        num_k=num_k,
-        scale=float(model.get("scale", 1.0)),
-        mean_type=str(model.get("mean_type", "s")),
+        **common,
         token_dim=int(model.get("token_dim", 64)),
         token_num_l5=int(model.get("token_num_l5", 128)),
         token_num_l4=int(model.get("token_num_l4", 192)),
@@ -260,7 +326,50 @@ class RegistrationObjective(nn.Module):
         return terms
 
 
+class BaselineRegistrationObjective(nn.Module):
+    """Original SACB-Net objective using only losses shared with the full model."""
+
+    def __init__(self, loss_config: Mapping[str, object]) -> None:
+        super().__init__()
+        self.weights = {
+            "similarity": float(loss_config.get("similarity", 1.0)),
+            "smoothness": float(loss_config.get("smoothness", 0.3)),
+        }
+        if any(value < 0.0 for value in self.weights.values()):
+            raise ValueError("loss weights must be nonnegative")
+        ncc_window = int(loss_config.get("ncc_window", 9))
+        if ncc_window <= 0 or ncc_window % 2 == 0:
+            raise ValueError("NCC window must be a positive odd integer")
+        self.ncc = NCC_vxm(win=[ncc_window] * 3)
+        self.smoothness = Grad3d(penalty="l2")
+
+    def forward(
+        self,
+        output: Mapping[str, object],
+        moving: torch.Tensor,
+        fixed: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        del moving
+        similarity = self.ncc(fixed, output["warped"])
+        smoothness = self.smoothness(output["flow"], None)
+        terms = {
+            "similarity": similarity,
+            "smoothness": smoothness,
+        }
+        terms["total"] = sum(self.weights[name] * value for name, value in terms.items())
+        return terms
+
+
+def build_objective(config: Mapping[str, object]) -> nn.Module:
+    loss_config = dict(config.get("loss", {}))
+    if config_architecture(config) == "sacb":
+        return BaselineRegistrationObjective(loss_config)
+    return RegistrationObjective(loss_config)
+
+
 def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
+    if "gate5" not in output:
+        return {}
     result = {
         "gate5": float(output["gate5"].detach().float().mean().cpu()),
         "gate4": float(output["gate4"].detach().float().mean().cpu()),
@@ -327,10 +436,14 @@ def bootstrap_mean_ci(
 
 
 __all__ = [
+    "BaselineRegistrationObjective",
+    "BaselineSACBNet",
     "RegistrationObjective",
     "atomic_torch_save",
     "bootstrap_mean_ci",
     "build_model",
+    "build_objective",
+    "config_architecture",
     "cuda_autocast",
     "finite_mean",
     "learning_rate_factor",

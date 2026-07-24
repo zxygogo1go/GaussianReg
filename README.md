@@ -66,6 +66,38 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_gam.py \
 
 The evaluator writes patient-level CSV/JSON and bootstrap 95% confidence intervals for pre/post NCC and Dice, HD95, ASSD, Jacobian folding, and deformation magnitude. A tumor class is eligible only when present in both original timepoints; if an eligible structure disappears after warping, it receives Dice 0 and an image-diagonal surface-distance penalty instead of being skipped. TRE is not reported because HNTS-MRG24 has no landmark annotations.
 
+## Controlled original SACB-Net baseline
+
+The repository retains the original SACB-Net architecture and provides a thin
+training-interface adapter so it can use the same HNTS-MRG24 split, optimizer,
+schedule, AMP safeguards, validation-NCC checkpoint selection, and held-out
+metrics as GAM-SACB-Net. The baseline objective contains only the losses shared
+with the original architecture: LNCC (weight 1.0) and displacement smoothness
+(weight 0.3). No GACM/GCDR auxiliary loss is applied.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_sacb_baseline.py \
+  --config configs/sacb_baseline_hntsmrg24.json \
+  --data-root /path/to/HNTSMRG24_gam_preprocessed \
+  --train-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/train.csv \
+  --validation-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/validation.csv \
+  --output-dir runs/sacb_baseline_hntsmrg24_seed2026 \
+  --device cuda:0
+```
+
+Evaluate the validation-NCC-selected baseline checkpoint exactly once on the
+held-out test split:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_sacb_baseline.py \
+  --checkpoint runs/sacb_baseline_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --data-root /path/to/HNTSMRG24_gam_preprocessed \
+  --manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/test.csv \
+  --output-dir results/sacb_baseline_hntsmrg24_seed2026_test \
+  --device cuda:0 \
+  --save-predictions
+```
+
 ## Verification
 
 ```bash
