@@ -14,13 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from losses import (
-    AnchorFlowConsistencyLoss,
-    GaussianTokenRegularization,
-    Grad3d,
-    NCC_vxm,
-    TransportCostLoss,
-)
+from losses import Grad3d, NCC_vxm
 from model import SACB_Net
 from model_gam import GAM_SACB_Net
 
@@ -192,12 +186,13 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         return baseline
     return GAM_SACB_Net(
         **common,
-        token_dim=int(model.get("token_dim", 64)),
-        token_num_l5=int(model.get("token_num_l5", 128)),
-        token_num_l4=int(model.get("token_num_l4", 192)),
-        num_types=int(model.get("num_types", 8)),
-        context_ch=int(model.get("context_channels", 11)),
-        fusion_hidden_ch=int(model.get("fusion_hidden_channels", 64)),
+        token_dim=int(model.get("token_dim", 32)),
+        token_num_l4=int(model.get("token_num_l4", 96)),
+        context_ch=int(model.get("context_channels", 8)),
+        residual_hidden_ch=int(model.get("residual_hidden_channels", 32)),
+        match_temperature=float(model.get("match_temperature", 0.10)),
+        position_cost_weight=float(model.get("position_cost_weight", 0.05)),
+        max_residual=float(model.get("max_residual", 1.0)),
         fix_kmeans_rng=bool(model.get("fix_kmeans_rng", True)),
         kmeans_max_iter=int(model.get("kmeans_max_iter", 20)),
         kmeans_tolerance=float(model.get("kmeans_tolerance", 1.0e-4)),
@@ -231,8 +226,39 @@ def warp_volume(source: torch.Tensor, flow_dhw: torch.Tensor, mode: str = "bilin
     )
 
 
+class JacobianFoldingLoss(nn.Module):
+    """Penalize local Jacobian determinants below a configurable margin."""
+
+    def __init__(self, margin: float = 0.0) -> None:
+        super().__init__()
+        self.margin = float(margin)
+
+    def forward(self, flow: torch.Tensor) -> torch.Tensor:
+        if flow.ndim != 5 or flow.shape[1] != 3:
+            raise AssertionError("flow must have shape [B,3,D,H,W]")
+        center = flow[:, :, :-1, :-1, :-1].float()
+        derivative_d = flow[:, :, 1:, :-1, :-1].float() - center
+        derivative_h = flow[:, :, :-1, 1:, :-1].float() - center
+        derivative_w = flow[:, :, :-1, :-1, 1:].float() - center
+        j00 = 1.0 + derivative_d[:, 0]
+        j01 = derivative_h[:, 0]
+        j02 = derivative_w[:, 0]
+        j10 = derivative_d[:, 1]
+        j11 = 1.0 + derivative_h[:, 1]
+        j12 = derivative_w[:, 1]
+        j20 = derivative_d[:, 2]
+        j21 = derivative_h[:, 2]
+        j22 = 1.0 + derivative_w[:, 2]
+        determinant = (
+            j00 * (j11 * j22 - j12 * j21)
+            - j01 * (j10 * j22 - j12 * j20)
+            + j02 * (j10 * j21 - j11 * j20)
+        )
+        return F.relu(self.margin - determinant).square().mean()
+
+
 class RegistrationObjective(nn.Module):
-    """Unsupervised image/geometry objective for the dual-module model."""
+    """Minimal unsupervised objective for Gaussian-correspondence SACB-Net."""
 
     def __init__(self, loss_config: Mapping[str, object]) -> None:
         super().__init__()
@@ -240,9 +266,7 @@ class RegistrationObjective(nn.Module):
             "similarity": float(loss_config.get("similarity", 1.0)),
             "smoothness": float(loss_config.get("smoothness", 0.3)),
             "deep_similarity": float(loss_config.get("deep_similarity", 1.0)),
-            "token": float(loss_config.get("token", 0.01)),
-            "transport": float(loss_config.get("transport", 0.02)),
-            "anchor": float(loss_config.get("anchor", 0.05)),
+            "jacobian": float(loss_config.get("jacobian", 0.01)),
         }
         if any(value < 0.0 for value in self.weights.values()):
             raise ValueError("loss weights must be nonnegative")
@@ -261,11 +285,9 @@ class RegistrationObjective(nn.Module):
         self.ncc = NCC_vxm(win=[ncc_window] * 3)
         self.deep_ncc = NCC_vxm(win=[deep_ncc_window] * 3)
         self.smoothness = Grad3d(penalty="l2")
-        self.token_regularization = GaussianTokenRegularization(
-            repulsion_scale=float(loss_config.get("token_repulsion_scale", 0.08))
+        self.jacobian = JacobianFoldingLoss(
+            margin=float(loss_config.get("jacobian_margin", 0.0))
         )
-        self.transport_cost = TransportCostLoss()
-        self.anchor_consistency = AnchorFlowConsistencyLoss()
 
     def forward(
         self,
@@ -275,6 +297,7 @@ class RegistrationObjective(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         similarity = self.ncc(fixed, output["warped"])
         smoothness = self.smoothness(output["flow"], None)
+        jacobian = self.jacobian(output["flow"])
 
         deep_similarity = similarity.new_zeros(())
         for name, scale_weight in self.deep_scale_weights.items():
@@ -286,40 +309,11 @@ class RegistrationObjective(nn.Module):
                 warp_volume(moving_scaled, flow),
             )
 
-        token_terms = []
-        transport_terms = []
-        for level in ("gacm5", "gacm4"):
-            gacm = output[level]
-            token_terms.extend(
-                (
-                    self.token_regularization(gacm["moving_tokens"]),
-                    self.token_regularization(gacm["fixed_tokens"]),
-                )
-            )
-            transport_terms.append(self.transport_cost(gacm["transport"], gacm["cost"]))
-        token = torch.stack(token_terms).mean()
-        transport = torch.stack(transport_terms).mean()
-        anchor = 0.5 * (
-            self.anchor_consistency(
-                output["phi5_native"],
-                output["gacm5"]["fixed_tokens"].mu,
-                output["gacm5"]["anchor_disp"],
-                output["gacm5"]["anchor_conf"],
-            )
-            + self.anchor_consistency(
-                output["delta4"],
-                output["gacm4"]["fixed_tokens"].mu,
-                output["gacm4"]["anchor_disp"],
-                output["gacm4"]["anchor_conf"],
-            )
-        )
         terms = {
             "similarity": similarity,
             "smoothness": smoothness,
             "deep_similarity": deep_similarity,
-            "token": token,
-            "transport": transport,
-            "anchor": anchor,
+            "jacobian": jacobian,
         }
         total = sum(self.weights[name] * value for name, value in terms.items())
         terms["total"] = total
@@ -368,23 +362,24 @@ def build_objective(config: Mapping[str, object]) -> nn.Module:
 
 
 def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
-    if "gate5" not in output:
+    if "gacm4" not in output:
         return {}
-    result = {
-        "gate5": float(output["gate5"].detach().float().mean().cpu()),
-        "gate4": float(output["gate4"].detach().float().mean().cpu()),
+    gacm = output["gacm4"]
+    correspondence = gacm["correspondence"].detach().float()
+    entropy = -(
+        correspondence
+        * correspondence.clamp_min(1.0e-8).log()
+    ).sum(dim=-1)
+    normalizer = max(math.log(float(correspondence.shape[-1])), 1.0)
+    return {
+        "gacm4_match_entropy": float((entropy / normalizer).mean().cpu()),
+        "gacm4_context_abs": float(
+            gacm["context"].detach().float().abs().mean().cpu()
+        ),
+        "residual4_abs": float(
+            output["residual4"].detach().float().abs().mean().cpu()
+        ),
     }
-    for level in ("gacm5", "gacm4"):
-        gacm = output[level]
-        result[level + "_visibility"] = float(
-            0.5
-            * (
-                gacm["moving_tokens"].visibility.detach().float().mean()
-                + gacm["fixed_tokens"].visibility.detach().float().mean()
-            ).cpu()
-        )
-        result[level + "_transport_mass"] = float(gacm["transport"].detach().float().sum(dim=(1, 2)).mean().cpu())
-    return result
 
 
 def learning_rate_factor(epoch: int, epochs: int, warmup_epochs: int, minimum_factor: float) -> float:
@@ -438,6 +433,7 @@ def bootstrap_mean_ci(
 __all__ = [
     "BaselineRegistrationObjective",
     "BaselineSACBNet",
+    "JacobianFoldingLoss",
     "RegistrationObjective",
     "atomic_torch_save",
     "bootstrap_mean_ci",

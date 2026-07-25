@@ -733,3 +733,10 @@ COST_VISIBILITY = 0.05
 - 输入 `(128,160,160)`，batch size 1，AMP 开启，AdamW，gradient clipping 5.0。
 - L5/L4 token 数默认 128/192；rasterization 与 Bures 必须分块并在 float32 中执行。
 - 保存 latest/best checkpoint、完整配置、数据 manifest hash、逐病例验证结果和 TensorBoard 日志。
+> **状态说明（minimal-v2）**
+>
+> 本文记录的是第一版双尺度 GACM/GCDR 设计，现仅作为历史设计与干预实验依据。
+> 当前可训练模型已经根据干预结果精简为：单尺度 L4 Gaussian token
+> correspondence + 轻量有界残差校正器。当前结构、配置和训练方式以
+> `README.md`、`model_gam.py` 和 `configs/gam_sacb_hntsmrg24.json` 为准。
+> 第一版 checkpoint 与 minimal-v2 不兼容。

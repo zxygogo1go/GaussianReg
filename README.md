@@ -1,9 +1,13 @@
 # GAM-SACB-Net for longitudinal head-and-neck registration
 
-This branch extends the official [SACB-Net](https://openaccess.thecvf.com/content/CVPR2025/html/Cheng_SACB-Net_Spatial-awareness_Convolutions_for_Medical_Image_Registration_CVPR_2025_paper.html) backbone with two research modules:
+This branch extends the official [SACB-Net](https://openaccess.thecvf.com/content/CVPR2025/html/Cheng_SACB-Net_Spatial-awareness_Convolutions_for_Medical_Image_Registration_CVPR_2025_paper.html) backbone with one compact research path at the L4 scale:
 
-1. **Gaussian Anatomy Correspondence Module (GACM)** for shared probabilistic anatomy tokenization, visibility-aware unbalanced transport, and dense Gaussian correspondence priors.
-2. **Geometry-Conditioned Dense Registration Module (GCDR)** for confidence-aware Gaussian/dense fusion, geometry-conditioned SACBs, and full-resolution context refinement.
+1. **Gaussian Anatomy Correspondence Module (GACM)** extracts shared diagonal-Gaussian tokens and matches them with feature/position softmax correspondence.
+2. A **lightweight geometry-conditioned residual corrector** rasterizes the matched token-feature residual and uses it to refine the original SACB dense flow.
+
+The minimal-v2 model has no learned visibility, confidence, anatomical type
+head, unbalanced transport, Bures covariance cost, standalone Gaussian flow,
+Gaussian/dense gate, or cross-scale context propagation.
 
 The original `SACB_Net` remains available. The new entry point is `GAM_SACB_Net` in `model_gam.py`.
 
@@ -42,13 +46,23 @@ CUDA_VISIBLE_DEVICES=0 python train_gam.py \
   --data-root /path/to/HNTSMRG24_gam_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/validation.csv \
-  --output-dir runs/gam_sacb_hntsmrg24_seed2026 \
+  --output-dir runs/gam_sacb_minimal_v2_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
-To initialize shared SACB-Net weights, add `--baseline-checkpoint /path/to/baseline.pth`. To continue an interrupted run, use `--resume runs/.../latest.pt`; the script rejects a resume if the config or manifest hashes differ.
+The same command is packaged as
+`scripts/train_gam_v2_hntsmrg24.sh DATA_ROOT GPU_ID RUN_DIR [BASELINE_CKPT]`.
+To initialize all shared backbone weights, add
+`--baseline-checkpoint /path/to/baseline.pth`. Minimal-v2 is structurally
+incompatible with checkpoints from the earlier dual-GCDR GAM model. To
+continue a minimal-v2 run, use `--resume runs/.../latest.pt`; the script
+rejects a resume if the config or manifest hashes differ.
 
-Training is unsupervised with respect to anatomy labels. It uses LNCC, displacement smoothness, multi-scale image similarity, token regularization, transport cost, and anchor-flow consistency. Logs are written to TensorBoard and `metrics.jsonl`. The best checkpoint is selected by validation image NCC rather than validation Dice.
+Training is unsupervised with respect to anatomy labels. It uses LNCC,
+displacement smoothness, multi-scale image similarity, and a small Jacobian
+folding penalty. There are no token, confidence, transport, or anchor-flow
+auxiliary losses. Logs are written to TensorBoard and `metrics.jsonl`. The best
+checkpoint is selected by validation image NCC rather than validation Dice.
 
 ## Evaluation
 
@@ -56,10 +70,10 @@ Run the held-out test manifest once after model/hyperparameter selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gam.py \
-  --checkpoint runs/gam_sacb_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gam_sacb_minimal_v2_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gam_preprocessed \
   --manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/test.csv \
-  --output-dir results/gam_sacb_hntsmrg24_seed2026 \
+  --output-dir results/gam_sacb_minimal_v2_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```
@@ -104,7 +118,10 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_sacb_baseline.py \
 python -m unittest discover -s tests -v
 ```
 
-The focused suite covers Gaussian SPD numerics, Sinkhorn gradients, GCDR initialization, full-model backward propagation, baseline checkpoint compatibility, DHW flow conventions, objective composition, medical metrics, and manifest/preprocessing behavior.
+The focused suite covers compact Gaussian tokenization, softmax
+correspondence, bounded residual correction, full-model backward propagation,
+baseline checkpoint compatibility, parameter budget, DHW flow conventions,
+objective composition, medical metrics, and manifest/preprocessing behavior.
 
 ## Original datasets and weights
 

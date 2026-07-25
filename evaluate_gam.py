@@ -178,6 +178,17 @@ def main(expected_architecture: Optional[str] = None) -> None:
             "this entry point requires model.architecture=%s, got %s"
             % (expected_architecture, architecture)
         )
+    if (
+        architecture == "gam_sacb"
+        and isinstance(checkpoint, dict)
+        and "model" in checkpoint
+        and checkpoint.get("architecture_revision", "legacy_v1")
+        != "minimal_v2"
+    ):
+        raise ValueError(
+            "this evaluator now targets minimal_v2; the supplied checkpoint "
+            "belongs to the legacy dual-GCDR GAM architecture"
+        )
     seed = int(config.get("seed", 2026))
     set_reproducibility(seed)
     device = resolve_device(args.device)
@@ -296,7 +307,18 @@ def main(expected_architecture: Optional[str] = None) -> None:
     summary = _summarize(records, seed=seed, bootstrap_samples=int(args.bootstrap_samples))
     result = {
         "architecture": architecture,
+        "architecture_revision": getattr(
+            model,
+            "architecture_revision",
+            checkpoint.get("architecture_revision", "original")
+            if isinstance(checkpoint, dict)
+            else "original",
+        ),
         "checkpoint": str(Path(args.checkpoint).resolve()),
+        "checkpoint_sha256": manifest_sha256(args.checkpoint),
+        "checkpoint_epoch": (
+            int(checkpoint["epoch"]) if isinstance(checkpoint, dict) and checkpoint.get("epoch") is not None else None
+        ),
         "manifest": str(Path(args.manifest).resolve()),
         "manifest_sha256": manifest_sha256(args.manifest),
         "summary": summary,

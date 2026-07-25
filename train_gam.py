@@ -1,4 +1,4 @@
-"""Train GAM-SACB-Net on preprocessed HNTS-MRG24 longitudinal pairs."""
+"""Train minimal-v2 GAM-SACB-Net on preprocessed HNTS-MRG24 pairs."""
 
 from __future__ import annotations
 
@@ -232,7 +232,12 @@ def _checkpoint(
     validation_metrics: Mapping[str, float],
 ) -> Dict[str, object]:
     return {
-        "format_version": 1,
+        "format_version": 2,
+        "architecture_revision": getattr(
+            model,
+            "architecture_revision",
+            "original",
+        ),
         "epoch": int(epoch),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -322,7 +327,15 @@ def main(expected_architecture: str = "gam_sacb") -> None:
 
     model = build_model(config).to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    print("architecture=%s trainable_parameters=%d" % (architecture, trainable_parameters))
+    architecture_revision = getattr(
+        model,
+        "architecture_revision",
+        "original",
+    )
+    print(
+        "architecture=%s revision=%s trainable_parameters=%d"
+        % (architecture, architecture_revision, trainable_parameters)
+    )
     if args.baseline_checkpoint:
         incompatible = model.load_sacb_checkpoint(args.baseline_checkpoint)
         print(
@@ -359,6 +372,15 @@ def main(expected_architecture: str = "gam_sacb") -> None:
     resume_checkpoint = None
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint_revision = resume_checkpoint.get(
+            "architecture_revision",
+            "legacy_v1",
+        )
+        if checkpoint_revision != architecture_revision:
+            raise ValueError(
+                "resume checkpoint revision %s does not match model revision %s"
+                % (checkpoint_revision, architecture_revision)
+            )
         if resume_checkpoint.get("config") != config:
             raise ValueError("resume checkpoint config does not match --config")
         if resume_checkpoint.get("manifest_sha256") != manifests:
@@ -371,6 +393,7 @@ def main(expected_architecture: str = "gam_sacb") -> None:
             "validation_manifest": str(Path(args.validation_manifest).resolve()),
             "device": str(device),
             "architecture": architecture,
+            "architecture_revision": architecture_revision,
             "trainable_parameters": int(trainable_parameters),
             "manifest_sha256": manifests,
         },

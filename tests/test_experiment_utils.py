@@ -34,10 +34,9 @@ class ExperimentUtilityTests(unittest.TestCase):
                 "channel_scale": 2,
                 "num_k": 3,
                 "token_dim": 8,
-                "token_num_l5": 8,
                 "token_num_l4": 8,
-                "num_types": 3,
-                "fusion_hidden_channels": 8,
+                "context_channels": 5,
+                "residual_hidden_channels": 8,
             },
         }
         model = build_model(config)
@@ -48,14 +47,20 @@ class ExperimentUtilityTests(unittest.TestCase):
         terms = objective(output, moving, fixed)
         self.assertTrue(all(bool(torch.isfinite(value)) for value in terms.values()))
         terms["total"].backward()
-        # The 32^3 smoke model has only 2^3 level-5 voxels, so its 8-anchor
-        # spatial attention is intentionally saturated. Query gradients are
-        # covered by the dedicated non-saturated tokenizer test; here verify
-        # that the assembled objective reaches the anatomy correspondence head.
-        gradient = model.gacm5.tokenizer.type_head.weight.grad
+        gradient = model.gacm4.residual_proj.weight.grad
         self.assertIsNotNone(gradient)
         self.assertTrue(bool(torch.isfinite(gradient).all()))
         self.assertGreater(float(gradient.abs().sum()), 0.0)
+        self.assertEqual(
+            set(terms),
+            {
+                "similarity",
+                "smoothness",
+                "deep_similarity",
+                "jacobian",
+                "total",
+            },
+        )
 
     def test_baseline_builder_preserves_original_state_and_common_objective(self):
         config = {
