@@ -1,6 +1,6 @@
 """Evaluate an original SACB-Net baseline checkpoint with the controlled protocol."""
 
-from evaluate_gam import main
+from evaluate_registration import main
 
 
 if __name__ == "__main__":

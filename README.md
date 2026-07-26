@@ -1,113 +1,169 @@
-# GAM-SACB-Net for longitudinal head-and-neck registration
+# Gaussian-native diffeomorphic registration for longitudinal head-and-neck MRI
 
-This branch extends the official [SACB-Net](https://openaccess.thecvf.com/content/CVPR2025/html/Cheng_SACB-Net_Spatial-awareness_Convolutions_for_Medical_Image_Registration_CVPR_2025_paper.html) backbone with one compact research path at the L4 scale:
+This repository contains a new registration model whose learned
+representation, correspondence, and deformation parameters are all Gaussian
+primitives. SACB-Net is retained only as a controlled baseline and is not part
+of the new model.
 
-1. **Gaussian Anatomy Correspondence Module (GACM)** extracts shared diagonal-Gaussian tokens and matches them with feature/position softmax correspondence.
-2. A **lightweight geometry-conditioned residual corrector** rasterizes the matched token-feature residual and uses it to refine the original SACB dense flow.
+```text
+Moving / Fixed volume
+        ↓
+Gaussian scale-space and derivative measurements
+        ↓
+Hierarchical anisotropic Gaussian decomposition
+64 → 256 → 1024 primitives
+        ↓
+Gaussian graph encoding
+        ↓
+Coarse-to-fine partial Gaussian transport
+        ↓
+Per-Gaussian local affine stationary velocity
+        ↓
+Multi-scale Gaussian SVF synthesis
+        ↓
+Scaling-and-squaring
+        ↓
+Dense diffeomorphic deformation
+```
 
-The minimal-v2 model has no learned visibility, confidence, anatomical type
-head, unbalanced transport, Bures covariance cost, standalone Gaussian flow,
-Gaussian/dense gate, or cross-scale context propagation.
+The implementation is organized around two research modules:
 
-The original `SACB_Net` remains available. The new entry point is `GAM_SACB_Net` in `model_gam.py`.
+1. **Hierarchical Gaussian Representation and Correspondence (HGRC)** learns
+   full-covariance, mass-conserving Gaussian anatomy hierarchies and explicit
+   partial correspondence with an unmatched dustbin.
+2. **Gaussian Stationary Velocity Field Generator (GSVF)** predicts
+   translation, rotation, and bounded strain for every Gaussian, rasterizes
+   coarse-to-fine residual velocities, and integrates the SVF into a
+   diffeomorphism.
+
+There is no SACB branch, learned dense-flow head, Gaussian/dense gate, or
+standalone confidence module in the new prediction path.
 
 ## Environment
 
 ```bash
-conda create -n myenv python=3.9
-conda activate myenv
+conda create -n gaussian-native python=3.9
+conda activate gaussian-native
 pip install -r requirements.txt
 ```
 
-The pinned environment follows the original PyTorch 1.13/CUDA 11.7 setup and adds SimpleITK for metadata-safe medical-image preprocessing.
+The code remains compatible with the original PyTorch 1.13/CUDA 11.7
+environment. The production configuration uses bfloat16 autocast on an A100;
+covariance, transport, rasterization, and integration calculations are kept in
+float32.
 
-## HNTS-MRG24 protocol
+## HNTS-MRG24 preprocessing
 
-The primary experiment is within-patient longitudinal T2 MRI registration: raw preRT is the moving image and midRT is fixed. The challenge-provided deformably registered preRT image is never used as a model input or training target. Tumor labels (`1=GTVp`, `2=GTVn`) are used only for validation/test metrics.
+The main experiment is within-patient longitudinal T2 MRI registration. Raw
+preRT after rigid/affine prealignment is moving and midRT is fixed. The
+challenge-provided deformably registered preRT image is excluded. Tumor labels
+(`1=GTVp`, `2=GTVn`) are reserved for validation and testing.
 
-Preprocessing performs deterministic rigid then affine mutual-information prealignment, resamples into a centered physical frame at 1.5 mm isotropic resolution and `(D,H,W)=(128,160,160)`, applies robust 0.5–99.5 percentile MRI normalization, checks tumor ROI coverage, and creates patient-disjoint stratified 80/10/10 manifests.
+Preprocessing creates 1.5 mm isotropic `(D,H,W)=(128,160,160)` volumes,
+performs robust MRI normalization and geometry QA, and writes patient-disjoint
+train/validation/test manifests.
 
 ```bash
 python prepare_hntsmrg24.py \
   --source-root /path/to/HNTSMRG24_train \
-  --output-root /path/to/HNTSMRG24_gam_preprocessed \
+  --output-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --num-workers 2
 ```
 
-If any case fails geometry, registration, label, or crop QA, preprocessing exits nonzero and records the reason in `dataset_summary.json`. Do not use `--allow-failures` for a final paper experiment without reporting exclusions.
+Do not use `--allow-failures` for a final paper experiment without reporting
+every exclusion recorded in `dataset_summary.json`.
 
-## Training
+## Gaussian-native training
 
-Run on one selected 40 GB A100. `CUDA_VISIBLE_DEVICES` should be chosen after checking current GPU occupancy.
+Run from the repository root on one selected A100. This is an explicit command;
+no shell launch wrapper is required.
+
+First run one production-shape forward/backward memory audit:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_gam.py \
-  --config configs/gam_sacb_hntsmrg24.json \
-  --data-root /path/to/HNTSMRG24_gam_preprocessed \
-  --train-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/train.csv \
-  --validation-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/validation.csv \
-  --output-dir runs/gam_sacb_minimal_v2_hntsmrg24_seed2026 \
+CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
+  --config configs/gaussian_native_hntsmrg24.json \
   --device cuda:0
 ```
 
-The same command is packaged as
-`scripts/train_gam_v2_hntsmrg24.sh DATA_ROOT GPU_ID RUN_DIR [BASELINE_CKPT]`.
-To initialize all shared backbone weights, add
-`--baseline-checkpoint /path/to/baseline.pth`. Minimal-v2 is structurally
-incompatible with checkpoints from the earlier dual-GCDR GAM model. To
-continue a minimal-v2 run, use `--resume runs/.../latest.pt`; the script
-rejects a resume if the config or manifest hashes differ.
+Proceed only if `"finite": true`. Record `peak_gpu_memory_mb` with the paper
+experiment metadata.
 
-Training is unsupervised with respect to anatomy labels. It uses LNCC,
-displacement smoothness, multi-scale image similarity, and a small Jacobian
-folding penalty. There are no token, confidence, transport, or anchor-flow
-auxiliary losses. Logs are written to TensorBoard and `metrics.jsonl`. The best
-checkpoint is selected by validation image NCC rather than validation Dice.
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
+  --config configs/gaussian_native_hntsmrg24.json \
+  --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
+  --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
+  --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
+  --output-dir runs/gaussian_native_v1_hntsmrg24_seed2026 \
+  --device cuda:0
+```
+
+The production model contains 64/256/1024 Gaussian primitives and about 2.08
+million trainable parameters. Training uses:
+
+- bidirectional multi-scale LNCC and normalized-gradient similarity;
+- Gaussian reconstruction, coverage, and hierarchy containment;
+- partial-transport cost, correspondence cycle, and hierarchy consistency;
+- SVF smoothness, inverse consistency, and a Jacobian safety barrier;
+- pair-direction reversal, shared left-right flipping, and independent MRI
+  intensity augmentation.
+
+The best checkpoint is selected by validation NCC, not tumor Dice. Resume only
+with the same configuration and manifest hashes:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
+  --config configs/gaussian_native_hntsmrg24.json \
+  --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
+  --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
+  --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
+  --output-dir runs/gaussian_native_v1_hntsmrg24_seed2026 \
+  --device cuda:0 \
+  --resume runs/gaussian_native_v1_hntsmrg24_seed2026/latest.pt
+```
 
 ## Evaluation
 
-Run the held-out test manifest once after model/hyperparameter selection:
+Evaluate the held-out test set after validation-based model selection:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python evaluate_gam.py \
-  --checkpoint runs/gam_sacb_minimal_v2_hntsmrg24_seed2026/best_validation_ncc.pt \
-  --data-root /path/to/HNTSMRG24_gam_preprocessed \
-  --manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/test.csv \
-  --output-dir results/gam_sacb_minimal_v2_hntsmrg24_seed2026 \
+CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
+  --checkpoint runs/gaussian_native_v1_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
+  --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
+  --output-dir results/gaussian_native_v1_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```
 
-The evaluator writes patient-level CSV/JSON and bootstrap 95% confidence intervals for pre/post NCC and Dice, HD95, ASSD, Jacobian folding, and deformation magnitude. A tumor class is eligible only when present in both original timepoints; if an eligible structure disappears after warping, it receives Dice 0 and an image-diagonal surface-distance penalty instead of being skipped. TRE is not reported because HNTS-MRG24 has no landmark annotations.
+The evaluator writes patient-level CSV/JSON and bootstrap 95% confidence
+intervals for NCC, Dice, HD95, ASSD, displacement, runtime, and Jacobian
+topology. A tumor class is eligible only when present in both original
+timepoints. If an eligible structure is lost after warping, it receives Dice 0
+and an image-diagonal surface-distance penalty.
 
-## Controlled original SACB-Net baseline
+## Controlled SACB-Net baseline
 
-The repository retains the original SACB-Net architecture and provides a thin
-training-interface adapter so it can use the same HNTS-MRG24 split, optimizer,
-schedule, AMP safeguards, validation-NCC checkpoint selection, and held-out
-metrics as GAM-SACB-Net. The baseline objective contains only the losses shared
-with the original architecture: LNCC (weight 1.0) and displacement smoothness
-(weight 0.3). No GACM/GCDR auxiliary loss is applied.
+The original SACB-Net can still be trained and evaluated with the same data
+split and reporting protocol:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_sacb_baseline.py \
   --config configs/sacb_baseline_hntsmrg24.json \
-  --data-root /path/to/HNTSMRG24_gam_preprocessed \
-  --train-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/train.csv \
-  --validation-manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/validation.csv \
+  --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
+  --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
+  --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
   --output-dir runs/sacb_baseline_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
-Evaluate the validation-NCC-selected baseline checkpoint exactly once on the
-held-out test split:
-
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_sacb_baseline.py \
   --checkpoint runs/sacb_baseline_hntsmrg24_seed2026/best_validation_ncc.pt \
-  --data-root /path/to/HNTSMRG24_gam_preprocessed \
-  --manifest /path/to/HNTSMRG24_gam_preprocessed/manifests/test.csv \
-  --output-dir results/sacb_baseline_hntsmrg24_seed2026_test \
+  --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
+  --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
+  --output-dir results/sacb_baseline_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```
@@ -118,16 +174,13 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_sacb_baseline.py \
 python -m unittest discover -s tests -v
 ```
 
-The focused suite covers compact Gaussian tokenization, softmax
-correspondence, bounded residual correction, full-model backward propagation,
-baseline checkpoint compatibility, parameter budget, DHW flow conventions,
-objective composition, medical metrics, and manifest/preprocessing behavior.
+The focused suite covers full SPD geometry, mass-conserving hierarchy,
+partial transport, parent-conditioned matching, Gaussian velocity synthesis,
+identity initialization, scaling-and-squaring inverse composition, full-model
+gradients, DHW flow direction, medical metrics, and dataset behavior.
 
-## Original datasets and weights
+## SACB-Net citation
 
-The original project supports [Learn2Reg abdomen CT-CT](https://learn2reg.grand-challenge.org/Datasets/) and LPBA. The original SACB-Net weights are available from [Google Drive](https://drive.google.com/drive/folders/1XW19iuyCyg3YGmCpLFGGFjdPFi73xxwh?usp=share_link).
-
-## Citation
 ```bibtex
 @InProceedings{Cheng_2025_CVPR,
     author    = {Cheng, Xinxing and Zhang, Tianyang and Lu, Wenqi and Meng, Qingjie and Frangi, Alejandro F. and Duan, Jinming},
@@ -138,6 +191,3 @@ The original project supports [Learn2Reg abdomen CT-CT](https://learn2reg.grand-
     pages     = {5227-5237}
 }
 ```
-
-## Acknowledgments
-We sincerely acknowledge the [ModeT](https://github.com/ZAX130/SmileCode), [CANNet](https://github.com/Duanyll/CANConv) and [TransMorph](https://github.com/junyuchen245/TransMorph_Transformer_for_Medical_Image_Registration) projects.

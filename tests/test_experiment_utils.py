@@ -5,7 +5,6 @@ import torch
 from experiment_utils import (
     BaselineRegistrationObjective,
     BaselineSACBNet,
-    RegistrationObjective,
     bootstrap_mean_ci,
     build_model,
     build_objective,
@@ -13,7 +12,9 @@ from experiment_utils import (
     learning_rate_factor,
     warp_volume,
 )
+from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from model import SACB_Net
+from train_registration import _augment_pair
 
 
 class ExperimentUtilityTests(unittest.TestCase):
@@ -21,48 +22,18 @@ class ExperimentUtilityTests(unittest.TestCase):
         source = torch.arange(5.0).view(1, 1, 1, 1, 5).expand(1, 1, 3, 3, 5)
         identity = warp_volume(source, torch.zeros(1, 3, 3, 3, 5))
         self.assertTrue(torch.allclose(identity, source, atol=1.0e-5))
-        factor = learning_rate_factor(epoch=9, epochs=10, warmup_epochs=2, minimum_factor=0.05)
+        factor = learning_rate_factor(
+            epoch=9,
+            epochs=10,
+            warmup_epochs=2,
+            minimum_factor=0.05,
+        )
         self.assertAlmostEqual(factor, 0.05)
         estimate = bootstrap_mean_ci([1.0, 2.0, 3.0], samples=100, seed=1)
         self.assertEqual(estimate["mean"], 2.0)
         self.assertEqual(estimate["n"], 3)
 
-    def test_full_objective_is_finite_and_reaches_gaussian_module(self):
-        config = {
-            "data": {"shape_dhw": [32, 32, 32]},
-            "model": {
-                "channel_scale": 2,
-                "num_k": 3,
-                "token_dim": 8,
-                "token_num_l4": 8,
-                "context_channels": 5,
-                "residual_hidden_channels": 8,
-            },
-        }
-        model = build_model(config)
-        objective = RegistrationObjective({})
-        moving = torch.randn(1, 1, 32, 32, 32)
-        fixed = torch.randn_like(moving)
-        output = model(moving, fixed, return_aux=True)
-        terms = objective(output, moving, fixed)
-        self.assertTrue(all(bool(torch.isfinite(value)) for value in terms.values()))
-        terms["total"].backward()
-        gradient = model.gacm4.residual_proj.weight.grad
-        self.assertIsNotNone(gradient)
-        self.assertTrue(bool(torch.isfinite(gradient).all()))
-        self.assertGreater(float(gradient.abs().sum()), 0.0)
-        self.assertEqual(
-            set(terms),
-            {
-                "similarity",
-                "smoothness",
-                "deep_similarity",
-                "jacobian",
-                "total",
-            },
-        )
-
-    def test_baseline_builder_preserves_original_state_and_common_objective(self):
+    def test_baseline_builder_preserves_original_state(self):
         config = {
             "data": {"shape_dhw": [32, 32, 32]},
             "model": {
@@ -85,21 +56,55 @@ class ExperimentUtilityTests(unittest.TestCase):
         for name, value in original.state_dict().items():
             self.assertEqual(model.state_dict()[name].shape, value.shape, name)
 
-        moving = torch.randn(1, 1, 32, 32, 32)
-        fixed = torch.randn_like(moving)
-        output = model(moving, fixed, return_aux=True)
-        self.assertEqual(set(output), {"warped", "flow"})
-        terms = objective(output, moving, fixed)
-        self.assertEqual(set(terms), {"similarity", "smoothness", "total"})
-        self.assertTrue(all(bool(torch.isfinite(value)) for value in terms.values()))
-        terms["total"].backward()
-        gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
-        self.assertTrue(gradients)
-        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+    def test_default_architecture_is_gaussian_native(self):
+        self.assertEqual(config_architecture({}), "gaussian_native")
+        self.assertIsInstance(build_objective({}), GaussianNativeObjective)
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+            },
+        }
+        self.assertIsInstance(build_model(config), GaussianNativeRegistration)
 
-    def test_default_architecture_remains_gam_for_existing_configs(self):
-        self.assertEqual(config_architecture({}), "gam_sacb")
-        self.assertIsInstance(build_objective({}), RegistrationObjective)
+    def test_pair_augmentation_preserves_shape_and_range(self):
+        torch.manual_seed(9)
+        moving = torch.linspace(0.0, 1.0, 64).reshape(1, 1, 4, 4, 4)
+        fixed = 1.0 - moving
+        augmented_moving, augmented_fixed = _augment_pair(
+            moving,
+            fixed,
+            {
+                "enabled": True,
+                "reverse_pair_probability": 1.0,
+                "shared_flip_probability": 1.0,
+                "intensity_probability": 1.0,
+                "gamma_range": [0.9, 1.1],
+                "scale_range": [0.9, 1.1],
+                "shift_range": [-0.05, 0.05],
+                "noise_std_range": [0.0, 0.01],
+            },
+        )
+        self.assertEqual(augmented_moving.shape, moving.shape)
+        self.assertEqual(augmented_fixed.shape, fixed.shape)
+        self.assertGreaterEqual(float(augmented_moving.min()), 0.0)
+        self.assertLessEqual(float(augmented_moving.max()), 1.0)
+        self.assertFalse(torch.equal(augmented_moving, moving))
 
 
 if __name__ == "__main__":

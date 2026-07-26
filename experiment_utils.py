@@ -1,4 +1,4 @@
-"""Shared experiment utilities for GAM-SACB-Net training and evaluation."""
+"""Shared experiment utilities for controlled registration experiments."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from torch import nn
 
 from losses import Grad3d, NCC_vxm
 from model import SACB_Net
-from model_gam import GAM_SACB_Net
+from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 
 
 def load_json(path: str) -> Dict[str, object]:
@@ -76,11 +76,19 @@ def resolve_device(requested: str) -> torch.device:
     return device
 
 
-def cuda_autocast(enabled: bool):
+def cuda_autocast(enabled: bool, dtype: str = "float16"):
     """Version-compatible CUDA autocast context (PyTorch 1.13 through 2.x)."""
+    normalized = str(dtype).strip().lower()
+    if normalized not in {"float16", "bfloat16"}:
+        raise ValueError("autocast dtype must be float16 or bfloat16")
+    torch_dtype = torch.float16 if normalized == "float16" else torch.bfloat16
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        return torch.amp.autocast(device_type="cuda", enabled=bool(enabled))
-    return torch.cuda.amp.autocast(enabled=bool(enabled))
+        return torch.amp.autocast(
+            device_type="cuda",
+            enabled=bool(enabled),
+            dtype=torch_dtype,
+        )
+    return torch.cuda.amp.autocast(enabled=bool(enabled), dtype=torch_dtype)
 
 
 def make_grad_scaler(
@@ -124,11 +132,11 @@ class BaselineSACBNet(SACB_Net):
 def config_architecture(config: Mapping[str, object]) -> str:
     """Return the canonical architecture name stored in an experiment config."""
     model = dict(config.get("model", {}))
-    architecture = str(model.get("architecture", "gam_sacb")).strip().lower().replace("-", "_")
+    architecture = str(model.get("architecture", "gaussian_native")).strip().lower().replace("-", "_")
     aliases = {
-        "gam": "gam_sacb",
-        "gam_sacb": "gam_sacb",
-        "gam_sacb_net": "gam_sacb",
+        "gaussian": "gaussian_native",
+        "gaussian_native": "gaussian_native",
+        "gaussian_native_registration": "gaussian_native",
         "sacb": "sacb",
         "sacb_net": "sacb",
         "baseline_sacb": "sacb",
@@ -163,20 +171,19 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
     shape = tuple(int(v) for v in data.get("shape_dhw", (128, 160, 160)))
     if len(shape) != 3 or any(value % 16 for value in shape):
         raise ValueError("data.shape_dhw must contain three values divisible by 16")
-    num_k = model.get("num_k", 7)
-    if isinstance(num_k, list):
-        num_k = tuple(int(value) for value in num_k)
-    common = {
-        "inshape": shape,
-        "in_c": int(model.get("in_channels", 1)),
-        "ch_scale": int(model.get("channel_scale", 4)),
-        "num_k": num_k,
-        "scale": float(model.get("scale", 1.0)),
-        "mean_type": str(model.get("mean_type", "s")),
-    }
     architecture = config_architecture(config)
     if architecture == "sacb":
-        baseline = BaselineSACBNet(**common)
+        num_k = model.get("num_k", 7)
+        if isinstance(num_k, list):
+            num_k = tuple(int(value) for value in num_k)
+        baseline = BaselineSACBNet(
+            inshape=shape,
+            in_c=int(model.get("in_channels", 1)),
+            ch_scale=int(model.get("channel_scale", 4)),
+            num_k=num_k,
+            scale=float(model.get("scale", 1.0)),
+            mean_type=str(model.get("mean_type", "s")),
+        )
         _configure_sacb_kmeans(
             baseline,
             fix_rng=bool(model.get("fix_kmeans_rng", True)),
@@ -184,18 +191,50 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
             tolerance=float(model.get("kmeans_tolerance", 1.0e-4)),
         )
         return baseline
-    return GAM_SACB_Net(
-        **common,
-        token_dim=int(model.get("token_dim", 32)),
-        token_num_l4=int(model.get("token_num_l4", 96)),
-        context_ch=int(model.get("context_channels", 8)),
-        residual_hidden_ch=int(model.get("residual_hidden_channels", 32)),
-        match_temperature=float(model.get("match_temperature", 0.10)),
-        position_cost_weight=float(model.get("position_cost_weight", 0.05)),
-        max_residual=float(model.get("max_residual", 1.0)),
-        fix_kmeans_rng=bool(model.get("fix_kmeans_rng", True)),
-        kmeans_max_iter=int(model.get("kmeans_max_iter", 20)),
-        kmeans_tolerance=float(model.get("kmeans_tolerance", 1.0e-4)),
+    root_grid = tuple(int(value) for value in model.get("root_grid_shape", (4, 4, 4)))
+    children_per_parent = int(model.get("children_per_parent", 4))
+    root_count = int(np.prod(root_grid))
+    expected_counts = [
+        root_count,
+        root_count * children_per_parent,
+        root_count * children_per_parent * children_per_parent,
+    ]
+    configured_counts = model.get("gaussian_counts")
+    if configured_counts is not None and [
+        int(value) for value in configured_counts
+    ] != expected_counts:
+        raise ValueError(
+            "model.gaussian_counts must match root_grid_shape and children_per_parent"
+        )
+    spacing = tuple(
+        float(value)
+        for value in data.get("spacing_dhw", (1.5, 1.5, 1.5))
+    )
+    return GaussianNativeRegistration(
+        inshape=shape,
+        spacing_dhw=spacing,
+        root_grid_shape=root_grid,
+        children_per_parent=children_per_parent,
+        feature_dim=int(model.get("feature_dim", 96)),
+        hidden_dim=int(model.get("hidden_dim", 128)),
+        graph_heads=int(model.get("graph_heads", 4)),
+        graph_neighbors=int(model.get("graph_neighbors", 16)),
+        graph_blocks_per_level=int(model.get("graph_blocks_per_level", 2)),
+        samples_per_axis=int(model.get("samples_per_axis", 3)),
+        pyramid_factors=tuple(int(value) for value in model.get("pyramid_factors", (16, 8, 4))),
+        sinkhorn_iterations=int(model.get("sinkhorn_iterations", 12)),
+        match_temperature=float(model.get("match_temperature", 0.08)),
+        position_weight=float(model.get("position_weight", 0.12)),
+        scale_weight=float(model.get("scale_weight", 0.04)),
+        dustbin_mass=float(model.get("dustbin_mass", 0.15)),
+        parent_candidates=int(model.get("parent_candidates", 4)),
+        velocity_hidden_dim=int(model.get("velocity_hidden_dim", 192)),
+        raster_chunk=int(model.get("raster_chunk", 64)),
+        cutoff_sigma=float(model.get("cutoff_sigma", 3.5)),
+        integration_steps=int(model.get("integration_steps", 7)),
+        motion_mode=str(model.get("motion_mode", "affine")),
+        integration_mode=str(model.get("integration_mode", "svf")),
+        covariance_mode=str(model.get("covariance_mode", "full")),
     )
 
 
@@ -257,69 +296,6 @@ class JacobianFoldingLoss(nn.Module):
         return F.relu(self.margin - determinant).square().mean()
 
 
-class RegistrationObjective(nn.Module):
-    """Minimal unsupervised objective for Gaussian-correspondence SACB-Net."""
-
-    def __init__(self, loss_config: Mapping[str, object]) -> None:
-        super().__init__()
-        self.weights = {
-            "similarity": float(loss_config.get("similarity", 1.0)),
-            "smoothness": float(loss_config.get("smoothness", 0.3)),
-            "deep_similarity": float(loss_config.get("deep_similarity", 1.0)),
-            "jacobian": float(loss_config.get("jacobian", 0.01)),
-        }
-        if any(value < 0.0 for value in self.weights.values()):
-            raise ValueError("loss weights must be nonnegative")
-        self.deep_scale_weights = {
-            "phi4_native": 0.05,
-            "phi3_native": 0.10,
-            "phi2_native": 0.15,
-        }
-        configured_deep = loss_config.get("deep_scale_weights")
-        if configured_deep is not None:
-            self.deep_scale_weights.update({key: float(value) for key, value in dict(configured_deep).items()})
-        ncc_window = int(loss_config.get("ncc_window", 9))
-        deep_ncc_window = int(loss_config.get("deep_ncc_window", 5))
-        if ncc_window <= 0 or ncc_window % 2 == 0 or deep_ncc_window <= 0 or deep_ncc_window % 2 == 0:
-            raise ValueError("NCC windows must be positive odd integers")
-        self.ncc = NCC_vxm(win=[ncc_window] * 3)
-        self.deep_ncc = NCC_vxm(win=[deep_ncc_window] * 3)
-        self.smoothness = Grad3d(penalty="l2")
-        self.jacobian = JacobianFoldingLoss(
-            margin=float(loss_config.get("jacobian_margin", 0.0))
-        )
-
-    def forward(
-        self,
-        output: Mapping[str, object],
-        moving: torch.Tensor,
-        fixed: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        similarity = self.ncc(fixed, output["warped"])
-        smoothness = self.smoothness(output["flow"], None)
-        jacobian = self.jacobian(output["flow"])
-
-        deep_similarity = similarity.new_zeros(())
-        for name, scale_weight in self.deep_scale_weights.items():
-            flow = output[name]
-            moving_scaled = F.interpolate(moving, size=flow.shape[2:], mode="trilinear", align_corners=True)
-            fixed_scaled = F.interpolate(fixed, size=flow.shape[2:], mode="trilinear", align_corners=True)
-            deep_similarity = deep_similarity + scale_weight * self.deep_ncc(
-                fixed_scaled,
-                warp_volume(moving_scaled, flow),
-            )
-
-        terms = {
-            "similarity": similarity,
-            "smoothness": smoothness,
-            "deep_similarity": deep_similarity,
-            "jacobian": jacobian,
-        }
-        total = sum(self.weights[name] * value for name, value in terms.items())
-        terms["total"] = total
-        return terms
-
-
 class BaselineRegistrationObjective(nn.Module):
     """Original SACB-Net objective using only losses shared with the full model."""
 
@@ -358,28 +334,38 @@ def build_objective(config: Mapping[str, object]) -> nn.Module:
     loss_config = dict(config.get("loss", {}))
     if config_architecture(config) == "sacb":
         return BaselineRegistrationObjective(loss_config)
-    return RegistrationObjective(loss_config)
+    return GaussianNativeObjective(loss_config)
 
 
 def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
-    if "gacm4" not in output:
+    if "correspondence" not in output:
         return {}
-    gacm = output["gacm4"]
-    correspondence = gacm["correspondence"].detach().float()
-    entropy = -(
-        correspondence
-        * correspondence.clamp_min(1.0e-8).log()
-    ).sum(dim=-1)
-    normalizer = max(math.log(float(correspondence.shape[-1])), 1.0)
-    return {
-        "gacm4_match_entropy": float((entropy / normalizer).mean().cpu()),
-        "gacm4_context_abs": float(
-            gacm["context"].detach().float().abs().mean().cpu()
+    diagnostics = {
+        "velocity_vox_abs": float(
+            output["velocity_vox"].detach().float().abs().mean().cpu()
         ),
-        "residual4_abs": float(
-            output["residual4"].detach().float().abs().mean().cpu()
+        "inverse_composition_abs": float(
+            (
+                output["flow"].detach().float()
+                + warp_volume(
+                    output["inverse_flow"].detach().float(),
+                    output["flow"].detach().float(),
+                )
+            ).abs().mean().cpu()
         ),
     }
+    for index, result in enumerate(output["correspondence"]):
+        plan = result["plan"].detach().float()
+        row = plan / plan.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+        entropy = -(row * row.clamp_min(1.0e-8).log()).sum(dim=-1)
+        normalizer = max(math.log(float(plan.shape[-1])), 1.0)
+        diagnostics["match_entropy_l%d" % index] = float(
+            (entropy / normalizer).mean().cpu()
+        )
+        diagnostics["matched_mass_l%d" % index] = float(
+            result["matched_mass_fraction"].detach().float().mean().cpu()
+        )
+    return diagnostics
 
 
 def learning_rate_factor(epoch: int, epochs: int, warmup_epochs: int, minimum_factor: float) -> float:
@@ -434,7 +420,6 @@ __all__ = [
     "BaselineRegistrationObjective",
     "BaselineSACBNet",
     "JacobianFoldingLoss",
-    "RegistrationObjective",
     "atomic_torch_save",
     "bootstrap_mean_ci",
     "build_model",
