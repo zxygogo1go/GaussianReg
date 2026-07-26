@@ -109,6 +109,11 @@ class GaussianNativeObjective(nn.Module):
         self.inverse_weight = float(config.get("inverse_weight", 0.50))
         self.jacobian_weight = float(config.get("jacobian_weight", 0.20))
         self.velocity_energy_weight = float(config.get("velocity_energy_weight", 0.01))
+        self.motion_hierarchy_weight = float(
+            config.get("motion_hierarchy_weight", 0.0)
+        )
+        if self.motion_hierarchy_weight < 0.0:
+            raise ValueError("motion_hierarchy_weight must be nonnegative")
         self.jacobian_margin = float(config.get("jacobian_margin", 0.05))
         self.ncc = LocalNCCLoss(window=int(config.get("ncc_window", 9)))
 
@@ -200,6 +205,44 @@ class GaussianNativeObjective(nn.Module):
         )
         return transport + self.cycle_weight * cycle + self.hierarchy_weight * hierarchy
 
+    def _motion_hierarchy(self, output: Mapping[str, object]) -> torch.Tensor:
+        """Softly centre additive child residuals without cancelling them."""
+        parameters = output["local_velocities"]
+        levels = output["fixed_decomposition"]["levels"]
+        penalty = output["velocity_vox"].new_zeros((), dtype=torch.float32)
+        count = 0
+        for child_level, parent_level, child_motion in zip(
+            levels[1:],
+            levels[:-1],
+            parameters[1:],
+        ):
+            children = int(child_level.centers_mm.shape[1] // parent_level.centers_mm.shape[1])
+            batch, parent_nodes = parent_level.centers_mm.shape[:2]
+            weights = child_level.mass.float().reshape(batch, parent_nodes, children)
+            weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
+
+            def weighted_parent_mean(value: torch.Tensor) -> torch.Tensor:
+                grouped = value.float().reshape(
+                    batch,
+                    parent_nodes,
+                    children,
+                    *value.shape[2:],
+                )
+                weight_shape = (*weights.shape, *([1] * (value.ndim - 2)))
+                return (grouped * weights.reshape(weight_shape)).sum(dim=2)
+
+            translation_mean = weighted_parent_mean(child_motion.translation_mm)
+            normalized_translation = (
+                translation_mean / parent_level.scales_mm.float().clamp_min(1.0e-3)
+            )
+            rotation_mean = weighted_parent_mean(child_motion.rotation_vector)
+            strain_mean = weighted_parent_mean(child_motion.strain_parameters)
+            penalty = penalty + normalized_translation.square().mean()
+            penalty = penalty + rotation_mean.square().mean()
+            penalty = penalty + strain_mean.square().mean()
+            count += 1
+        return penalty / float(max(count, 1))
+
     def _deformation(self, output: Mapping[str, object]) -> torch.Tensor:
         velocity = output["velocity_vox"].float()
         flow = output["flow"].float()
@@ -209,11 +252,13 @@ class GaussianNativeObjective(nn.Module):
         smoothness = velocity_smoothness(velocity)
         energy = velocity.square().mean()
         topology = jacobian_barrier(flow, margin=self.jacobian_margin)
+        motion_hierarchy = self._motion_hierarchy(output)
         return (
             smoothness
             + self.inverse_weight * inverse_consistency
             + self.jacobian_weight * topology
             + self.velocity_energy_weight * energy
+            + self.motion_hierarchy_weight * motion_hierarchy
         )
 
     def forward(

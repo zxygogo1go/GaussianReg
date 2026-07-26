@@ -210,6 +210,9 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         float(value)
         for value in data.get("spacing_dhw", (1.5, 1.5, 1.5))
     )
+    architecture_revision = str(
+        model.get("architecture_revision", "gaussian_native_v2")
+    ).strip().lower()
     return GaussianNativeRegistration(
         inshape=shape,
         spacing_dhw=spacing,
@@ -235,6 +238,17 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         motion_mode=str(model.get("motion_mode", "affine")),
         integration_mode=str(model.get("integration_mode", "svf")),
         covariance_mode=str(model.get("covariance_mode", "full")),
+        architecture_revision=architecture_revision,
+        direct_displacement_fractions=tuple(
+            float(value)
+            for value in model.get(
+                "direct_displacement_fractions",
+                (1.0, 1.0, 1.0),
+            )
+        ),
+        direct_displacement_limit=float(
+            model.get("direct_displacement_limit", 1.5)
+        ),
     )
 
 
@@ -364,6 +378,30 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
         )
         diagnostics["matched_mass_l%d" % index] = float(
             result["matched_mass_fraction"].detach().float().mean().cpu()
+        )
+        if "transport_delta_mm" in result:
+            diagnostics["transport_delta_l%d_mm" % index] = float(
+                torch.linalg.vector_norm(
+                    result["transport_delta_mm"].detach().float(),
+                    dim=-1,
+                ).mean().cpu()
+            )
+    for index, parameters in enumerate(output.get("local_velocities", ())):
+        diagnostics["direct_translation_l%d_mm" % index] = float(
+            torch.linalg.vector_norm(
+                parameters.direct_translation_mm.detach().float(),
+                dim=-1,
+            ).mean().cpu()
+        )
+        diagnostics["learned_translation_l%d_mm" % index] = float(
+            torch.linalg.vector_norm(
+                parameters.learned_translation_mm.detach().float(),
+                dim=-1,
+            ).mean().cpu()
+        )
+    for index, field in enumerate(output.get("level_velocity_mm", ())):
+        diagnostics["level_velocity_l%d_abs_mm" % index] = float(
+            field.detach().float().abs().mean().cpu()
         )
     return diagnostics
 

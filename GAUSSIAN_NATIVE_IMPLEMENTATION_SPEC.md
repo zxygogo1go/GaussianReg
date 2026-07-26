@@ -142,17 +142,24 @@ offset, log-scale ratio, and relative covariance.
 The final motion layer is zero-initialized, so an untrained model is exactly
 the identity deformation.
 
-### 4.2 Identifiable motion hierarchy
+### 4.2 Identity-calibrated residual motion hierarchy
 
-The root level predicts the coarse velocity. Middle and fine local parameters
-are forced to have zero mean among the four children of each parent:
+Revision v2 subtracts a fixed-to-fixed self-transport barycentre from the
+fixed-to-moving transport barycentre. This removes entropic matching bias,
+gives exactly zero direct displacement for identical inputs, and lets
+correspondence drive motion without a confidence or scale gate.
+
+The root level predicts coarse motion. Middle and fine levels use the
+calibrated transport displacement relative to their parent. Child residuals
+are not forcibly centred; their mass-weighted parent mean is regularized
+softly in the deformation objective:
 
 \[
 v=v^{0}+\Delta v^{1}+\Delta v^{2}.
 \]
 
-This fixed additive hierarchy replaces a learned scale gate and prevents the
-model from trivially selecting only one motion level.
+This additive hierarchy avoids counting a global translation three times
+while preserving nonzero local motion at the middle and fine levels.
 
 ### 4.3 Gaussian velocity synthesis
 

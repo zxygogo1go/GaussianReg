@@ -30,7 +30,7 @@ def _autocast_disabled(device: torch.device):
 class GaussianNativeRegistration(nn.Module):
     """Gaussian representation → correspondence → SVF → diffeomorphism."""
 
-    architecture_revision = "gaussian_native_v1"
+    architecture_revision = "gaussian_native_v2"
 
     def __init__(
         self,
@@ -58,8 +58,18 @@ class GaussianNativeRegistration(nn.Module):
         motion_mode: str = "affine",
         integration_mode: str = "svf",
         covariance_mode: str = "full",
+        architecture_revision: str = "gaussian_native_v2",
+        direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
+        direct_displacement_limit: float = 1.5,
     ) -> None:
         super().__init__()
+        self.architecture_revision = str(architecture_revision).strip().lower()
+        if self.architecture_revision not in {
+            "gaussian_native_v1",
+            "gaussian_native_v2",
+        }:
+            raise ValueError("unsupported Gaussian-native architecture revision")
+        use_v2_motion = self.architecture_revision == "gaussian_native_v2"
         self.inshape = tuple(int(value) for value in inshape)
         self.pyramid_factors = tuple(int(value) for value in pyramid_factors)
         self.integration_mode = str(integration_mode).strip().lower()
@@ -96,12 +106,16 @@ class GaussianNativeRegistration(nn.Module):
             sinkhorn_iterations=sinkhorn_iterations,
             parent_candidates=parent_candidates,
             children_per_parent=children_per_parent,
+            identity_calibration=use_v2_motion,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,
             hidden_dim=velocity_hidden_dim,
             children_per_parent=children_per_parent,
             motion_mode=motion_mode,
+            hierarchy_mode="soft_residual" if use_v2_motion else "hard_centered",
+            direct_displacement_fractions=direct_displacement_fractions,
+            direct_displacement_limit=direct_displacement_limit,
         )
         self.velocity_synthesis = HierarchicalGaussianVelocitySynthesis(
             node_chunk=raster_chunk,

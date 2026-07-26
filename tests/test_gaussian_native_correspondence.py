@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import torch
 
@@ -60,6 +61,42 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
         gradients = [parameter.grad for parameter in self.matcher.parameters() if parameter.grad is not None]
         self.assertTrue(gradients)
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
+
+    def test_identity_calibrated_transport_is_zero_for_identical_inputs(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        results = self.matcher(fixed, fixed, extent)
+        for result in results:
+            self.assertTrue(
+                torch.allclose(
+                    result["transport_delta_mm"],
+                    torch.zeros_like(result["transport_delta_mm"]),
+                    atol=1.0e-6,
+                )
+            )
+
+    def test_identity_calibration_recovers_global_gaussian_translation(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        shift = torch.tensor([[[2.0, -1.0, 0.5]]])
+        moving = [
+            replace(level, centers_mm=level.centers_mm + shift)
+            for level in fixed
+        ]
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            position_weight=0.0,
+            sinkhorn_iterations=5,
+            parent_candidates=2,
+            identity_calibration=True,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            self.assertTrue(
+                torch.allclose(
+                    result["transport_delta_mm"],
+                    shift.expand_as(result["transport_delta_mm"]),
+                    atol=2.0e-4,
+                )
+            )
 
 
 if __name__ == "__main__":

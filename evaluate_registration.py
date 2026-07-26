@@ -200,6 +200,21 @@ def main(expected_architecture: Optional[str] = None) -> None:
         persistent_workers=bool(args.num_workers > 0),
     )
     model = build_model(config)
+    checkpoint_revision = (
+        checkpoint.get("architecture_revision")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    model_revision = getattr(model, "architecture_revision", None)
+    if (
+        checkpoint_revision is not None
+        and model_revision is not None
+        and checkpoint_revision != model_revision
+    ):
+        raise ValueError(
+            "checkpoint revision %s does not match configured model revision %s"
+            % (checkpoint_revision, model_revision)
+        )
     state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
     state = {key.removeprefix("module."): value for key, value in state.items()}
     model.load_state_dict(state, strict=True)

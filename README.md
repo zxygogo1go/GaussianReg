@@ -78,11 +78,16 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
+The current production revision is v2. It uses identity-calibrated Gaussian
+transport as a direct motion path and replaces hard child-velocity centering
+with a soft hierarchy loss. The v1 configuration remains available only for
+reproducing the earlier conservative experiment.
+
 First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_hntsmrg24.json \
+  --config configs/gaussian_native_v2_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -91,11 +96,11 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_hntsmrg24.json \
+  --config configs/gaussian_native_v2_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v1_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v2_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
@@ -114,13 +119,13 @@ with the same configuration and manifest hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_hntsmrg24.json \
+  --config configs/gaussian_native_v2_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v1_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v2_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v1_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v2_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -129,10 +134,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v1_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v2_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v1_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v2_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```

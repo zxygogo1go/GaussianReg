@@ -156,10 +156,12 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         sinkhorn_iterations: int = 12,
         parent_candidates: int = 4,
         children_per_parent: int = 4,
+        identity_calibration: bool = True,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
         self.children_per_parent = int(children_per_parent)
+        self.identity_calibration = bool(identity_calibration)
         self.matchers = nn.ModuleList(
             [
                 PartialSinkhornMatcher(
@@ -224,9 +226,34 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         if len(fixed_levels) != 3 or len(moving_levels) != 3:
             raise AssertionError("correspondence expects three levels")
         results = []
+        reference_parent_plan = None
         for index, (fixed, moving, matcher) in enumerate(
             zip(fixed_levels, moving_levels, self.matchers)
         ):
+            reference_center = fixed.centers_mm
+            if self.identity_calibration:
+                reference_mask = None
+                if index:
+                    if fixed.parent_index is None or reference_parent_plan is None:
+                        raise AssertionError("self-calibrated child matching requires parents")
+                    reference_mask = self._candidate_mask(
+                        reference_parent_plan,
+                        fixed.parent_index,
+                        fixed.parent_index,
+                    )
+                # The fixed-to-fixed transport is a non-learned calibration
+                # reference. Subtracting its barycentre removes entropic
+                # transport bias and guarantees zero direct displacement for
+                # identical inputs without introducing a confidence gate.
+                with torch.no_grad():
+                    reference = matcher(
+                        fixed,
+                        fixed,
+                        extent_mm,
+                        candidate_mask=reference_mask,
+                    )
+                reference_center = reference["matched_center_mm"]
+                reference_parent_plan = reference["plan"]
             mask = None
             if index:
                 if fixed.parent_index is None or moving.parent_index is None:
@@ -238,6 +265,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                 )
             result = matcher(fixed, moving, extent_mm, candidate_mask=mask)
             result["candidate_mask"] = mask
+            result["identity_reference_center_mm"] = reference_center
+            result["transport_delta_mm"] = (
+                result["matched_center_mm"] - reference_center
+            )
             result["hierarchy_error"] = (
                 result["transport_cost"].new_zeros(())
                 if index == 0

@@ -22,6 +22,8 @@ class GaussianVelocityParameters:
     linear: torch.Tensor
     rotation_vector: torch.Tensor
     strain_parameters: torch.Tensor
+    direct_translation_mm: torch.Tensor
+    learned_translation_mm: torch.Tensor
 
 
 class GaussianVelocityHead(nn.Module):
@@ -34,19 +36,36 @@ class GaussianVelocityHead(nn.Module):
         children_per_parent: int = 4,
         translation_fraction: float = 0.40,
         correspondence_fraction: float = 0.0,
+        direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
+        direct_displacement_limit: float = 1.5,
         max_rotation_radians: float = 0.20,
         max_strain: float = 0.08,
         motion_mode: str = "affine",
+        hierarchy_mode: str = "soft_residual",
     ) -> None:
         super().__init__()
         self.children_per_parent = int(children_per_parent)
         self.translation_fraction = float(translation_fraction)
         self.correspondence_fraction = float(correspondence_fraction)
+        self.direct_displacement_fractions = tuple(
+            float(value) for value in direct_displacement_fractions
+        )
+        if (
+            len(self.direct_displacement_fractions) != 3
+            or any(value < 0.0 for value in self.direct_displacement_fractions)
+        ):
+            raise ValueError("direct_displacement_fractions must contain three nonnegative values")
+        self.direct_displacement_limit = float(direct_displacement_limit)
+        if self.direct_displacement_limit <= 0.0:
+            raise ValueError("direct_displacement_limit must be positive")
         self.max_rotation_radians = float(max_rotation_radians)
         self.max_strain = float(max_strain)
         self.motion_mode = str(motion_mode).strip().lower()
         if self.motion_mode not in {"translation", "se3", "affine"}:
             raise ValueError("motion_mode must be translation, se3, or affine")
+        self.hierarchy_mode = str(hierarchy_mode).strip().lower()
+        if self.hierarchy_mode not in {"hard_centered", "soft_residual"}:
+            raise ValueError("hierarchy_mode must be hard_centered or soft_residual")
         input_dim = 2 * feature_dim + 15
         self.level_embedding = nn.Parameter(torch.zeros(3, feature_dim))
         nn.init.normal_(self.level_embedding, std=0.02)
@@ -70,15 +89,33 @@ class GaussianVelocityHead(nn.Module):
         grouped = grouped - grouped.mean(dim=2, keepdim=True)
         return grouped.reshape_as(value)
 
+    def _bounded_vector(
+        self,
+        value: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        normalized = value / scale.clamp_min(1.0e-3)
+        length = torch.linalg.vector_norm(normalized, dim=-1, keepdim=True)
+        factor = (self.direct_displacement_limit / length.clamp_min(1.0e-6)).clamp(
+            max=1.0
+        )
+        return value * factor
+
     def forward(
         self,
         fixed_levels: List[GaussianLevel],
         correspondence: List[dict],
     ) -> List[GaussianVelocityParameters]:
         parameters = []
+        calibrated_deltas = []
         for level_index, (fixed, match) in enumerate(zip(fixed_levels, correspondence)):
             delta = match["matched_center_mm"] - fixed.centers_mm
-            normalized_delta = delta / fixed.scales_mm.clamp_min(1.0e-3)
+            motion_delta = (
+                match["transport_delta_mm"]
+                if self.hierarchy_mode == "soft_residual"
+                else delta
+            )
+            normalized_delta = motion_delta / fixed.scales_mm.clamp_min(1.0e-3)
             log_scale_ratio = torch.log(
                 match["matched_scale_mm"].clamp_min(1.0e-3)
                 / fixed.scales_mm.clamp_min(1.0e-3)
@@ -107,27 +144,50 @@ class GaussianVelocityHead(nn.Module):
                 * fixed.scales_mm
                 * self.translation_fraction
             )
-            if level_index == 0:
+            if self.hierarchy_mode == "hard_centered" and level_index == 0:
                 bounded_delta = torch.maximum(
                     torch.minimum(delta, 2.0 * fixed.scales_mm),
                     -2.0 * fixed.scales_mm,
                 )
-                translation = (
-                    translation_residual
-                    + self.correspondence_fraction * bounded_delta
-                )
+                learned_translation = translation_residual
+                direct_translation = self.correspondence_fraction * bounded_delta
                 rotation_vector = (
                     torch.tanh(raw[..., 3:6]) * self.max_rotation_radians
                 )
                 strain_parameters = torch.tanh(raw[..., 6:12]) * self.max_strain
-            else:
-                translation = self._zero_parent_mean(translation_residual)
+            elif self.hierarchy_mode == "hard_centered":
+                learned_translation = self._zero_parent_mean(translation_residual)
+                direct_translation = torch.zeros_like(learned_translation)
                 rotation_vector = self._zero_parent_mean(
                     torch.tanh(raw[..., 3:6]) * self.max_rotation_radians
                 )
                 strain_parameters = self._zero_parent_mean(
                     torch.tanh(raw[..., 6:12]) * self.max_strain
                 )
+            else:
+                if "transport_delta_mm" not in match:
+                    raise KeyError("soft_residual velocity requires calibrated transport displacement")
+                calibrated_delta = match["transport_delta_mm"]
+                if level_index:
+                    if fixed.parent_index is None:
+                        raise AssertionError("child velocity requires parent indices")
+                    calibrated_residual = (
+                        calibrated_delta
+                        - calibrated_deltas[-1][:, fixed.parent_index]
+                    )
+                else:
+                    calibrated_residual = calibrated_delta
+                calibrated_deltas.append(calibrated_delta)
+                direct_translation = (
+                    self.direct_displacement_fractions[level_index]
+                    * self._bounded_vector(calibrated_residual, fixed.scales_mm)
+                )
+                learned_translation = translation_residual
+                rotation_vector = (
+                    torch.tanh(raw[..., 3:6]) * self.max_rotation_radians
+                )
+                strain_parameters = torch.tanh(raw[..., 6:12]) * self.max_strain
+            translation = learned_translation + direct_translation
             if self.motion_mode == "translation":
                 rotation_vector = torch.zeros_like(rotation_vector)
                 strain_parameters = torch.zeros_like(strain_parameters)
@@ -140,6 +200,8 @@ class GaussianVelocityHead(nn.Module):
                     linear=linear,
                     rotation_vector=rotation_vector,
                     strain_parameters=strain_parameters,
+                    direct_translation_mm=direct_translation,
+                    learned_translation_mm=learned_translation,
                 )
             )
         return parameters

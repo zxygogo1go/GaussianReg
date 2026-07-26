@@ -1,10 +1,12 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from experiment_utils import build_model, build_objective
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from gaussian_native.integration import ScalingAndSquaring, compose_displacements
+from gaussian_native.velocity import GaussianVelocityHead
 from metrics import jacobian_metrics
 
 
@@ -35,6 +37,87 @@ def small_config():
 
 
 class GaussianNativeModelTests(unittest.TestCase):
+    def test_v2_child_transport_is_additive_not_hard_centered(self):
+        feature_dim = 8
+        head = GaussianVelocityHead(
+            feature_dim=feature_dim,
+            hidden_dim=16,
+            children_per_parent=4,
+            motion_mode="translation",
+            hierarchy_mode="soft_residual",
+            direct_displacement_fractions=(1.0, 1.0, 1.0),
+        )
+        counts = (1, 4, 16)
+        parent_indices = (
+            None,
+            torch.zeros(4, dtype=torch.long),
+            torch.arange(4).repeat_interleave(4),
+        )
+        levels = []
+        matches = []
+        absolute_deltas = []
+        root_delta = torch.tensor([[[2.0, 0.0, 0.0]]])
+        middle_delta = root_delta[:, parent_indices[1]] + torch.tensor(
+            [[[0.0, 1.0, 0.0]]]
+        )
+        fine_delta = middle_delta[:, parent_indices[2]] + torch.tensor(
+            [[[0.0, 0.0, 0.5]]]
+        )
+        absolute_deltas.extend((root_delta, middle_delta, fine_delta))
+        for count, parent_index, delta in zip(
+            counts,
+            parent_indices,
+            absolute_deltas,
+        ):
+            centers = torch.zeros(1, count, 3)
+            scales = torch.full_like(centers, 10.0)
+            covariance = torch.eye(3).reshape(1, 1, 3, 3).expand(1, count, -1, -1)
+            features = torch.zeros(1, count, feature_dim)
+            levels.append(
+                SimpleNamespace(
+                    centers_mm=centers,
+                    scales_mm=scales,
+                    precision_mm2=covariance,
+                    features=features,
+                    parent_index=parent_index,
+                )
+            )
+            matches.append(
+                {
+                    "matched_center_mm": centers,
+                    "matched_scale_mm": scales,
+                    "matched_covariance_mm2": covariance,
+                    "matched_feature": features,
+                    "transport_delta_mm": delta,
+                }
+            )
+        parameters = head(levels, matches)
+        expected = (
+            torch.tensor([2.0, 0.0, 0.0]),
+            torch.tensor([0.0, 1.0, 0.0]),
+            torch.tensor([0.0, 0.0, 0.5]),
+        )
+        for motion, target in zip(parameters, expected):
+            self.assertTrue(
+                torch.allclose(
+                    motion.direct_translation_mm,
+                    target.reshape(1, 1, 3).expand_as(
+                        motion.direct_translation_mm
+                    ),
+                    atol=1.0e-6,
+                )
+            )
+        self.assertGreater(
+            float(
+                parameters[1]
+                .translation_mm.detach()
+                .mean(dim=1)
+                .abs()
+                .sum()
+            ),
+            0.0,
+        )
+
     def test_principal_ablation_switches_construct_and_run(self):
         config = small_config()
         config["model"].update(
