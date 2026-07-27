@@ -79,22 +79,25 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
-The current production revision is v5. It anchors matching with normalized
-Gaussian intensity/derivative measurements, combines them with learned
-features, and uses masked row-softmax rather than globally constrained
-Sinkhorn. Fixed-to-moving and fixed-to-fixed calibration use the exact same
-candidate set, which removes the child-mask mismatch seen in v4. Candidate-
-normalized entropy deterministically attenuates ambiguous residual motion; it
-is not a learned confidence branch. Canonical anchors remain the stable
-velocity rasterization basis. Matching temperature is annealed from 0.10 to
-0.06 over the first 40 epochs. Earlier revisions remain available only for
+The current production revision is v6. It retains v5's masked row-softmax and
+shared fixed-to-moving/fixed-to-fixed support, but removes the forced identity
+parent candidate. Normalized Gaussian intensity/derivative measurements anchor
+early matching and are cosine-annealed from weight 0.75 to 0.25 over 30
+epochs, allowing learned anatomy features to take over. Candidate-normalized
+entropy remains a deterministic ambiguity statistic, but its square root
+weights motion so uncertain child residuals are not suppressed linearly.
+Middle/fine direct residual capacity is increased while the root contribution
+is slightly reduced. Canonical anchors remain the stable velocity
+rasterization basis, and a stronger representation anchor prevents the
+fine-Gaussian drift observed in v5. Matching temperature is annealed from 0.12
+to 0.07 over 60 epochs. Earlier revisions remain available only for
 reproducing prior experiments.
 
 First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_v5_hntsmrg24.json \
+  --config configs/gaussian_native_v6_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -103,11 +106,11 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v5_hntsmrg24.json \
+  --config configs/gaussian_native_v6_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v5_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v6_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
@@ -124,9 +127,10 @@ million trainable parameters. Training uses:
 Each validation record includes NCC and Dice before/after registration,
 improvements, displacement, and topology. The console also reports coarse
 support-normalized matching entropy, deterministic match evidence, row maximum,
-diagonal probability, and calibrated transport displacement. Clearly harmful
-or stalled runs are stopped by configured fail-fast rules and retain a
-`failed_epoch_XXXX.pt` checkpoint with the exact reason.
+effective motion evidence, diagonal probability, and calibrated transport
+displacement. Clearly harmful or stalled runs are stopped by configured
+fail-fast rules and retain a `failed_epoch_XXXX.pt` checkpoint with the exact
+reason.
 
 The best checkpoint is selected by validation NCC, not tumor Dice, and is
 written only when NCC improves over the unregistered pair and the negative
@@ -135,13 +139,13 @@ manifest hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v5_hntsmrg24.json \
+  --config configs/gaussian_native_v6_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v5_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v6_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v5_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v6_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -150,10 +154,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v5_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v6_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v5_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v6_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```

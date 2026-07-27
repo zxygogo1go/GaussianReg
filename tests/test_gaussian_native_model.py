@@ -255,6 +255,84 @@ class GaussianNativeModelTests(unittest.TestCase):
             0.0,
         )
 
+    def test_v6_square_root_evidence_restores_child_residual_capacity(self):
+        feature_dim = 8
+        head = GaussianVelocityHead(
+            feature_dim=feature_dim,
+            hidden_dim=16,
+            children_per_parent=4,
+            motion_mode="translation",
+            hierarchy_mode="soft_residual",
+            direct_displacement_fractions=(1.0, 1.0, 1.0),
+            direct_displacement_limits_mm=(20.0, 20.0, 20.0),
+            learned_translation_fractions=(0.0, 0.0, 0.0),
+            use_match_evidence=True,
+            match_evidence_power=0.5,
+        )
+        parent_indices = (
+            None,
+            torch.zeros(4, dtype=torch.long),
+            torch.arange(4).repeat_interleave(4),
+        )
+        absolute_deltas = (
+            torch.tensor([[[2.0, 0.0, 0.0]]]),
+            torch.tensor([[[2.0, 2.0, 0.0]]]).expand(1, 4, 3),
+            torch.tensor([[[2.0, 2.0, 1.0]]]).expand(1, 16, 3),
+        )
+        evidences = (
+            torch.ones(1, 1),
+            torch.full((1, 4), 0.25),
+            torch.zeros(1, 16),
+        )
+        levels = []
+        matches = []
+        for count, parent_index, delta, evidence in zip(
+            (1, 4, 16),
+            parent_indices,
+            absolute_deltas,
+            evidences,
+        ):
+            centers = torch.zeros(1, count, 3)
+            scales = torch.full_like(centers, 10.0)
+            covariance = (
+                torch.eye(3)
+                .reshape(1, 1, 3, 3)
+                .expand(1, count, -1, -1)
+            )
+            features = torch.zeros(1, count, feature_dim)
+            levels.append(
+                SimpleNamespace(
+                    centers_mm=centers,
+                    scales_mm=scales,
+                    precision_mm2=covariance,
+                    features=features,
+                    parent_index=parent_index,
+                )
+            )
+            matches.append(
+                {
+                    "matched_center_mm": centers + delta,
+                    "matched_scale_mm": scales,
+                    "matched_covariance_mm2": covariance,
+                    "matched_feature": features,
+                    "transport_delta_mm": delta,
+                    "match_evidence": evidence,
+                }
+            )
+        parameters = head(levels, matches)
+        expected_child = torch.tensor([0.0, 1.0, 0.0])
+        self.assertTrue(
+            torch.allclose(
+                parameters[1].direct_translation_mm,
+                expected_child.reshape(1, 1, 3).expand(1, 4, 3),
+                atol=1.0e-6,
+            )
+        )
+        self.assertEqual(
+            float(parameters[2].direct_translation_mm.abs().max()),
+            0.0,
+        )
+
     def test_v5_similarity_gradient_reaches_learned_correspondence(self):
         config = small_config()
         config["model"].update(

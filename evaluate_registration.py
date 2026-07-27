@@ -239,10 +239,40 @@ def main(expected_architecture: Optional[str] = None) -> None:
         if setter is not None:
             setter(float(checkpoint_temperature))
             configured_temperature = float(checkpoint_temperature)
+    configured_appearance_weight = getattr(
+        getattr(model, "correspondence", None),
+        "appearance_weight",
+        None,
+    )
+    checkpoint_appearance_weight = (
+        checkpoint.get("correspondence_appearance_weight")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if checkpoint_appearance_weight is not None:
+        setter = getattr(
+            model,
+            "set_correspondence_appearance_weight",
+            None,
+        )
+        if setter is not None:
+            setter(float(checkpoint_appearance_weight))
+            configured_appearance_weight = float(
+                checkpoint_appearance_weight
+            )
     if configured_temperature is not None:
         print(
-            "correspondence_temperature=%.6f checkpoint_epoch=%d"
-            % (configured_temperature, checkpoint_epoch)
+            (
+                "correspondence_temperature=%.6f "
+                "appearance_weight=%s checkpoint_epoch=%d"
+            )
+            % (
+                configured_temperature,
+                "%.6f" % configured_appearance_weight
+                if configured_appearance_weight is not None
+                else "n/a",
+                checkpoint_epoch,
+            )
         )
     model.to(device).eval()
     ncc = NCC_vxm(win=[int(dict(config.get("loss", {})).get("ncc_window", 9))] * 3).to(device)

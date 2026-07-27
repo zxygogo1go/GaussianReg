@@ -104,10 +104,11 @@ Parent features are explicitly propagated into the child level.
 The root level performs global all-to-all transport. For each finer level, the
 top parent transports define the admissible child correspondence mask.
 
-Production revision v5 combines a learned anatomy descriptor with a fixed
-appearance anchor. The anchor is the detached Gaussian-window
+Production revision v6 combines a learned anatomy descriptor with a scheduled
+fixed appearance anchor. The anchor is the detached Gaussian-window
 intensity/derivative vector, standardized independently in each volume and
-L2-normalized. The matching cost is:
+L2-normalized. Its weight is high during initialization and annealed as the
+learned anatomy descriptor becomes task-conditioned. The matching cost is:
 
 \[
 C_{ij}
@@ -119,15 +120,16 @@ C_{ij}
 +\lambda_s\left\|\log\sigma_i^f-\log\sigma_j^m\right\|_2^2.
 \]
 
-Production v5 applies temperature-scaled row-softmax on the admissible support.
-Every fine-level support contains the same-index parent plus the strongest
-transported parents. Forbidden entries are explicitly zeroed and renormalized,
-so sparse support cannot be undone by a marginal constraint. Fixed-to-moving
-and fixed-to-fixed calibration use the exact same support. Sinkhorn, dustbin,
-and mutual transport remain implementation ablations but are not in v5.
+Production v6 applies temperature-scaled row-softmax on the admissible support.
+Fine-level support contains only the strongest transported parents; unlike v5,
+the same-index parent is not inserted unconditionally. Forbidden entries are
+explicitly zeroed and renormalized, so sparse support cannot be undone by a
+marginal constraint. Fixed-to-moving and fixed-to-fixed calibration use the
+exact same support. Sinkhorn, dustbin, and mutual transport remain
+implementation ablations but are not in v6.
 
 The transport yields matched moving features, centers, scales, and covariances
-for every fixed Gaussian. Expected transport cost is not optimized in v5
+for every fixed Gaussian. Expected transport cost is not optimized in v6
 because it admits uniform or feature-collapse shortcuts; registration
 similarity supplies the task gradient through the learned portion of the
 matching score.
@@ -155,7 +157,8 @@ while identical inputs have exactly zero calibrated transport displacement.
 
 ### 4.2 Anatomy-calibrated residual motion hierarchy
 
-Revision v5 computes appearance-anchored fixed-to-moving correspondence in the
+Revision v6 computes scheduled appearance-anchored fixed-to-moving
+correspondence in the
 learned anatomical Gaussian frame. Its direct displacement is:
 
 \[
@@ -173,7 +176,7 @@ Explicit centre/scale matching costs are detached from geometry prediction so
 that geometry cannot directly lower those costs by moving itself. Geometry
 can still affect correspondence through Gaussian graph features. A low
 position weight is only a soft anatomical locality prior, and the matching
-temperature is cosine-annealed from 0.10 to 0.06.
+temperature is cosine-annealed from 0.12 to 0.07.
 
 The root level predicts coarse motion. Middle and fine levels use the
 calibrated transport displacement relative to their parent. For candidate
@@ -181,14 +184,15 @@ support \(S_i\), ambiguity is measured as:
 
 \[
 h_i = \frac{-\sum_{j\in S_i}q_{ij}\log q_{ij}}{\log |S_i|},
-\qquad e_i=1-h_i.
+\qquad e_i=1-h_i,\qquad \tilde e_i=\sqrt{e_i}.
 \]
 
-The deterministic factor \(e_i\) multiplies only the current level's residual
-after parent subtraction. Therefore an ambiguous child match contributes no
-new residual and cannot cancel reliable parent motion. This is a derived
-transport statistic, not a trainable confidence predictor. Child residuals
-are not forcibly centred:
+The deterministic factor \(\tilde e_i\) multiplies only the current level's
+residual after parent subtraction. Exact uniform ambiguity still contributes
+no new residual and cannot cancel reliable parent motion, while partially
+informative middle/fine correspondence is no longer suppressed linearly as in
+v5. This is a derived transport statistic, not a trainable confidence
+predictor. Child residuals are not forcibly centred:
 
 \[
 v=v^{0}+\Delta v^{1}+\Delta v^{2}.
@@ -253,7 +257,7 @@ The objective has four reported groups:
    - parent/child containment.
 3. **Correspondence**
    - reported expected transport cost, cycle error, and hierarchy consistency;
-   - production v5 group weight is zero to avoid the self-minimizing
+   - production v6 group weight is zero to avoid the self-minimizing
      correspondence shortcut.
 4. **Deformation**
    - SVF derivative energy;
@@ -271,11 +275,13 @@ used only for response-aware Dice, HD95, and ASSD.
 - Feature width: 128.
 - Graph encoder: three blocks per level, eight heads, 16 neighbours.
 - Production transport: strict-support row-softmax.
-- Fixed appearance weight: 0.75.
-- Matching temperature: cosine 0.10 to 0.06 over 40 epochs.
-- Position weight: 0.12.
+- Fixed appearance weight: cosine 0.75 to 0.25 over 30 epochs.
+- Matching temperature: cosine 0.12 to 0.07 over 60 epochs.
+- Position weight: 0.05.
 - Production dustbin mass: 0.
 - Production motion: translation-only local Gaussian residuals.
+- Direct residual fractions: 0.75/1.0/0.75 for root/middle/fine levels.
+- Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
 - Integration steps: 7.
 - Trainable parameters: 2,082,046.

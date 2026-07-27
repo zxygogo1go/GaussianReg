@@ -61,6 +61,13 @@ class PartialSinkhornMatcher(nn.Module):
             raise ValueError("temperature must be positive")
         self.temperature = float(temperature)
 
+    def set_appearance_weight(self, appearance_weight: float) -> None:
+        """Update the fixed appearance contribution to the matching cost."""
+        appearance_weight = float(appearance_weight)
+        if not 0.0 <= appearance_weight <= 1.0:
+            raise ValueError("appearance_weight must lie in [0, 1]")
+        self.appearance_weight = appearance_weight
+
     def _coordinates(self, level: GaussianLevel) -> torch.Tensor:
         if self.coordinate_mode == "learned":
             return level.centers_mm
@@ -373,6 +380,19 @@ class HierarchicalGaussianCorrespondence(nn.Module):
     def set_temperature(self, temperature: float) -> None:
         for matcher in self.matchers:
             matcher.set_temperature(temperature)
+
+    @property
+    def appearance_weight(self) -> float:
+        weights = {matcher.appearance_weight for matcher in self.matchers}
+        if len(weights) != 1:
+            raise RuntimeError(
+                "correspondence levels have inconsistent appearance weights"
+            )
+        return weights.pop()
+
+    def set_appearance_weight(self, appearance_weight: float) -> None:
+        for matcher in self.matchers:
+            matcher.set_appearance_weight(appearance_weight)
 
     def _candidate_mask(
         self,

@@ -5,6 +5,7 @@ import torch
 from experiment_utils import (
     BaselineRegistrationObjective,
     BaselineSACBNet,
+    appearance_weight_for_epoch,
     bootstrap_mean_ci,
     build_model,
     build_objective,
@@ -173,6 +174,52 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertEqual(model.velocity_head.motion_mode, "translation")
         self.assertTrue(model.velocity_synthesis.rasterizer.use_canonical_basis)
 
+    def test_v6_builder_removes_forced_identity_and_restores_fine_motion(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v6",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "transport_mode": "row_softmax",
+                "appearance_weight": 0.75,
+                "appearance_weight_end": 0.25,
+                "appearance_weight_anneal_epochs": 5,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "match_evidence_power": 0.5,
+                "motion_mode": "translation",
+                "direct_displacement_fractions": [0.75, 1.0, 0.75],
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v6")
+        self.assertTrue(model.correspondence.shared_calibration_candidates)
+        self.assertFalse(model.correspondence.include_identity_candidate)
+        self.assertAlmostEqual(model.velocity_head.match_evidence_power, 0.5)
+        self.assertEqual(
+            model.velocity_head.direct_displacement_fractions,
+            (0.75, 1.0, 0.75),
+        )
+        configure_model_for_epoch(model, config, 1)
+        self.assertAlmostEqual(model.correspondence.appearance_weight, 0.75)
+        configure_model_for_epoch(model, config, 5)
+        self.assertAlmostEqual(model.correspondence.appearance_weight, 0.25)
+
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {
             "model": {
@@ -199,6 +246,21 @@ class ExperimentUtilityTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             correspondence_temperature_for_epoch(config, 0)
+
+    def test_appearance_weight_schedule_boundaries(self):
+        config = {
+            "model": {
+                "appearance_weight": 0.75,
+                "appearance_weight_end": 0.25,
+                "appearance_weight_anneal_epochs": 5,
+            }
+        }
+        self.assertAlmostEqual(appearance_weight_for_epoch(config, 1), 0.75)
+        self.assertAlmostEqual(appearance_weight_for_epoch(config, 3), 0.5)
+        self.assertAlmostEqual(appearance_weight_for_epoch(config, 5), 0.25)
+        self.assertAlmostEqual(appearance_weight_for_epoch(config, 50), 0.25)
+        with self.assertRaises(ValueError):
+            appearance_weight_for_epoch(config, 0)
 
     def test_identity_collapse_warning_requires_joint_signature(self):
         train = {
@@ -247,6 +309,34 @@ class ExperimentUtilityTests(unittest.TestCase):
         )
         config["monitoring"]["fail_fast_enabled"] = False
         self.assertEqual(_fail_fast_reason(3, history, config), "")
+
+    def test_fail_fast_monitor_detects_fine_gaussian_drift(self):
+        history = [
+            {
+                "train": {
+                    "anchor_offset_l2": 1.2,
+                    "support_entropy_l0": 0.5,
+                    "row_max_probability_l0": 0.2,
+                },
+                "validation": {
+                    "ncc_after": 0.3,
+                    "ncc_improvement": 0.01,
+                    "dice_improvement": 0.0,
+                    "negative_jacobian_ratio": 0.0,
+                    "p95_displacement_mm": 5.0,
+                },
+            }
+        ]
+        config = {
+            "monitoring": {
+                "fail_fast_enabled": True,
+                "maximum_anchor_offset_l2": 1.0,
+            }
+        }
+        self.assertIn(
+            "anchor offset",
+            _fail_fast_reason(1, history, config),
+        )
 
     def test_pair_augmentation_preserves_shape_and_range(self):
         torch.manual_seed(9)

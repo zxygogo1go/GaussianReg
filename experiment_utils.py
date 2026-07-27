@@ -217,6 +217,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v3",
         "gaussian_native_v4",
         "gaussian_native_v5",
+        "gaussian_native_v6",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -254,6 +255,14 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         architecture_revision=architecture_revision,
         appearance_weight=float(model.get("appearance_weight", 0.0)),
         transport_mode=str(model.get("transport_mode", "sinkhorn")),
+        include_identity_candidate=(
+            None
+            if "include_identity_candidate" not in model
+            else bool(model["include_identity_candidate"])
+        ),
+        match_evidence_power=float(
+            model.get("match_evidence_power", 1.0)
+        ),
         direct_displacement_fractions=tuple(
             float(value)
             for value in model.get(
@@ -444,6 +453,9 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
                 ).mean().cpu()
             )
     for index, parameters in enumerate(output.get("local_velocities", ())):
+        diagnostics["motion_evidence_l%d" % index] = float(
+            parameters.motion_evidence.detach().float().mean().cpu()
+        )
         diagnostics["direct_translation_l%d_mm" % index] = float(
             torch.linalg.vector_norm(
                 parameters.direct_translation_mm.detach().float(),
@@ -506,6 +518,36 @@ def correspondence_temperature_for_epoch(
     return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
 
 
+def appearance_weight_for_epoch(
+    config: Mapping[str, object],
+    epoch: int,
+) -> float:
+    """Cosine-anneal the fixed Gaussian appearance anchor contribution."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    model = dict(config.get("model", {}))
+    start = float(model.get("appearance_weight", 0.0))
+    end = float(model.get("appearance_weight_end", start))
+    anneal_epochs = int(model.get("appearance_weight_anneal_epochs", 1))
+    if (
+        not 0.0 <= start <= 1.0
+        or not 0.0 <= end <= 1.0
+        or anneal_epochs <= 0
+    ):
+        raise ValueError(
+            "appearance weights must lie in [0, 1] and anneal epochs be positive"
+        )
+    if anneal_epochs == 1:
+        return end
+    progress = min(
+        max(float(epoch - 1) / float(anneal_epochs - 1), 0.0),
+        1.0,
+    )
+    return end + 0.5 * (start - end) * (
+        1.0 + math.cos(math.pi * progress)
+    )
+
+
 def configure_model_for_epoch(
     model: nn.Module,
     config: Mapping[str, object],
@@ -517,6 +559,13 @@ def configure_model_for_epoch(
         return None
     temperature = correspondence_temperature_for_epoch(config, epoch)
     setter(temperature)
+    appearance_setter = getattr(
+        model,
+        "set_correspondence_appearance_weight",
+        None,
+    )
+    if appearance_setter is not None:
+        appearance_setter(appearance_weight_for_epoch(config, epoch))
     return temperature
 
 
@@ -563,6 +612,7 @@ __all__ = [
     "BaselineSACBNet",
     "JacobianFoldingLoss",
     "atomic_torch_save",
+    "appearance_weight_for_epoch",
     "bootstrap_mean_ci",
     "build_model",
     "build_objective",

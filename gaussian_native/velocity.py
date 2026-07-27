@@ -24,6 +24,7 @@ class GaussianVelocityParameters:
     strain_parameters: torch.Tensor
     direct_translation_mm: torch.Tensor
     learned_translation_mm: torch.Tensor
+    motion_evidence: torch.Tensor
 
 
 class GaussianVelocityHead(nn.Module):
@@ -45,6 +46,7 @@ class GaussianVelocityHead(nn.Module):
         motion_mode: str = "affine",
         hierarchy_mode: str = "soft_residual",
         use_match_evidence: bool = False,
+        match_evidence_power: float = 1.0,
     ) -> None:
         super().__init__()
         self.children_per_parent = int(children_per_parent)
@@ -90,6 +92,9 @@ class GaussianVelocityHead(nn.Module):
         if self.hierarchy_mode not in {"hard_centered", "soft_residual"}:
             raise ValueError("hierarchy_mode must be hard_centered or soft_residual")
         self.use_match_evidence = bool(use_match_evidence)
+        self.match_evidence_power = float(match_evidence_power)
+        if self.match_evidence_power <= 0.0:
+            raise ValueError("match_evidence_power must be positive")
         input_dim = 2 * feature_dim + 15
         self.level_embedding = nn.Parameter(torch.zeros(3, feature_dim))
         nn.init.normal_(self.level_embedding, std=0.02)
@@ -151,6 +156,7 @@ class GaussianVelocityHead(nn.Module):
                 if self.hierarchy_mode == "soft_residual"
                 else delta
             )
+            motion_evidence = torch.ones_like(motion_delta[..., :1])
             normalized_delta = motion_delta / motion_scale.clamp_min(1.0e-3)
             log_scale_ratio = torch.log(
                 match["matched_scale_mm"].clamp_min(1.0e-3)
@@ -209,11 +215,14 @@ class GaussianVelocityHead(nn.Module):
                         raise KeyError(
                             "evidence-weighted velocity requires match_evidence"
                         )
-                    motion_evidence = match["match_evidence"].unsqueeze(-1)
-                else:
-                    motion_evidence = torch.ones_like(
-                        calibrated_delta[..., :1]
+                    motion_evidence = (
+                        match["match_evidence"]
+                        .clamp(0.0, 1.0)
+                        .pow(self.match_evidence_power)
+                        .unsqueeze(-1)
                     )
+                else:
+                    motion_evidence = torch.ones_like(calibrated_delta[..., :1])
                 if level_index:
                     if fixed.parent_index is None:
                         raise AssertionError("child velocity requires parent indices")
@@ -259,6 +268,7 @@ class GaussianVelocityHead(nn.Module):
                     strain_parameters=strain_parameters,
                     direct_translation_mm=direct_translation,
                     learned_translation_mm=learned_translation,
+                    motion_evidence=motion_evidence.squeeze(-1),
                 )
             )
         return parameters

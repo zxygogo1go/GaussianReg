@@ -217,6 +217,18 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.matcher.set_temperature(0.0)
 
+    def test_appearance_weight_setter_updates_all_levels(self):
+        self.matcher.set_appearance_weight(0.35)
+        self.assertAlmostEqual(self.matcher.appearance_weight, 0.35)
+        self.assertTrue(
+            all(
+                abs(level_matcher.appearance_weight - 0.35) < 1.0e-12
+                for level_matcher in self.matcher.matchers
+            )
+        )
+        with self.assertRaises(ValueError):
+            self.matcher.set_appearance_weight(1.1)
+
     def test_v5_row_softmax_has_strict_mask_and_shared_calibration_support(self):
         fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
         moving, _ = self._represent(torch.rand(1, 1, 32, 32, 32))
@@ -300,6 +312,27 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
                 )
             )
             self.assertLess(float(result["match_evidence"].abs().max()), 1.0e-5)
+
+    def test_v6_candidate_support_does_not_force_identity_parent(self):
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            parent_candidates=1,
+            include_identity_candidate=False,
+        )
+        parent_plan = torch.tensor(
+            [[[0.0, 1.0], [1.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        parent_index = torch.tensor([0, 0, 1, 1])
+        mask = matcher._candidate_mask(
+            parent_plan,
+            parent_index,
+            parent_index,
+        )
+        self.assertFalse(
+            bool(torch.diagonal(mask, dim1=1, dim2=2).any())
+        )
+        self.assertTrue(bool(mask.any(dim=2).all()))
 
 
 if __name__ == "__main__":
