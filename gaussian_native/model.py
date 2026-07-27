@@ -59,6 +59,8 @@ class GaussianNativeRegistration(nn.Module):
         integration_mode: str = "svf",
         covariance_mode: str = "full",
         architecture_revision: str = "gaussian_native_v3",
+        appearance_weight: float = 0.0,
+        transport_mode: str = "sinkhorn",
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
         direct_displacement_limit: float = 1.5,
         direct_displacement_limits_mm: Optional[Sequence[float]] = (12.0, 6.0, 3.0),
@@ -73,19 +75,26 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v2",
             "gaussian_native_v3",
             "gaussian_native_v4",
+            "gaussian_native_v5",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
             "gaussian_native_v2",
             "gaussian_native_v3",
             "gaussian_native_v4",
+            "gaussian_native_v5",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
             "gaussian_native_v4",
+            "gaussian_native_v5",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
-        use_v4_motion = self.architecture_revision == "gaussian_native_v4"
+        use_anatomical_motion = self.architecture_revision in {
+            "gaussian_native_v4",
+            "gaussian_native_v5",
+        }
+        use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         rotation_limit = (
             0.08
             if max_rotation_radians is None and use_stable_motion_basis
@@ -143,7 +152,11 @@ class GaussianNativeRegistration(nn.Module):
             # barycentre bias while preserving moving-to-fixed centre drift.
             coordinate_mode="canonical" if use_v3_motion else "learned",
             mutual_transport=use_v3_motion,
-            detach_geometry_cost=use_v4_motion,
+            detach_geometry_cost=use_anatomical_motion,
+            appearance_weight=appearance_weight if use_v5_motion else 0.0,
+            transport_mode=transport_mode if use_v5_motion else "sinkhorn",
+            shared_calibration_candidates=use_v5_motion,
+            include_identity_candidate=use_v5_motion,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,
@@ -163,6 +176,7 @@ class GaussianNativeRegistration(nn.Module):
             ),
             max_rotation_radians=rotation_limit,
             max_strain=strain_limit,
+            use_match_evidence=use_v5_motion,
         )
         self.velocity_synthesis = HierarchicalGaussianVelocitySynthesis(
             node_chunk=raster_chunk,

@@ -180,6 +180,125 @@ class GaussianNativeModelTests(unittest.TestCase):
             )
             self.assertLessEqual(float(norm.detach().max()), limit + 1.0e-5)
 
+    def test_v5_uniform_child_match_cannot_cancel_parent_motion(self):
+        feature_dim = 8
+        head = GaussianVelocityHead(
+            feature_dim=feature_dim,
+            hidden_dim=16,
+            children_per_parent=4,
+            motion_mode="translation",
+            hierarchy_mode="soft_residual",
+            direct_displacement_fractions=(1.0, 1.0, 1.0),
+            direct_displacement_limits_mm=(20.0, 20.0, 20.0),
+            learned_translation_fractions=(0.0, 0.0, 0.0),
+            use_match_evidence=True,
+        )
+        counts = (1, 4, 16)
+        parent_indices = (
+            None,
+            torch.zeros(4, dtype=torch.long),
+            torch.arange(4).repeat_interleave(4),
+        )
+        absolute_deltas = (
+            torch.tensor([[[2.0, 0.0, 0.0]]]),
+            torch.tensor([[[3.0, 1.0, 0.0]]]).expand(1, 4, 3),
+            torch.tensor([[[4.0, 2.0, 1.0]]]).expand(1, 16, 3),
+        )
+        levels = []
+        matches = []
+        for level_index, (count, parent_index, delta) in enumerate(
+            zip(counts, parent_indices, absolute_deltas)
+        ):
+            centers = torch.zeros(1, count, 3)
+            scales = torch.full_like(centers, 10.0)
+            covariance = (
+                torch.eye(3)
+                .reshape(1, 1, 3, 3)
+                .expand(1, count, -1, -1)
+            )
+            features = torch.zeros(1, count, feature_dim)
+            levels.append(
+                SimpleNamespace(
+                    centers_mm=centers,
+                    scales_mm=scales,
+                    precision_mm2=covariance,
+                    features=features,
+                    parent_index=parent_index,
+                )
+            )
+            matches.append(
+                {
+                    "matched_center_mm": centers + delta,
+                    "matched_scale_mm": scales,
+                    "matched_covariance_mm2": covariance,
+                    "matched_feature": features,
+                    "transport_delta_mm": delta,
+                    "match_evidence": torch.ones(1, count)
+                    if level_index == 0
+                    else torch.zeros(1, count),
+                }
+            )
+        parameters = head(levels, matches)
+        self.assertTrue(
+            torch.allclose(
+                parameters[0].direct_translation_mm,
+                absolute_deltas[0],
+                atol=1.0e-6,
+            )
+        )
+        self.assertEqual(
+            float(parameters[1].direct_translation_mm.abs().max()),
+            0.0,
+        )
+        self.assertEqual(
+            float(parameters[2].direct_translation_mm.abs().max()),
+            0.0,
+        )
+
+    def test_v5_similarity_gradient_reaches_learned_correspondence(self):
+        config = small_config()
+        config["model"].update(
+            {
+                "architecture_revision": "gaussian_native_v5",
+                "transport_mode": "row_softmax",
+                "appearance_weight": 0.75,
+                "dustbin_mass": 0.0,
+                "motion_mode": "translation",
+                "direct_displacement_limits_mm": [8.0, 3.0, 1.5],
+            }
+        )
+        config["loss"].update(
+            {
+                "similarity": 1.0,
+                "representation": 0.0,
+                "correspondence": 0.0,
+                "deformation": 0.0,
+                "ngf_weight": 0.0,
+            }
+        )
+        model = build_model(config)
+        objective = build_objective(config)
+        moving = torch.rand(1, 1, 32, 32, 32)
+        fixed = torch.rand_like(moving)
+        output = model(moving, fixed, return_aux=True)
+        terms = objective(output, moving, fixed)
+        terms["total"].backward()
+        projection_gradient = (
+            model.correspondence.matchers[0].feature_projection.weight.grad
+        )
+        encoder_gradients = [
+            parameter.grad
+            for parameter in model.encoder.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertIsNotNone(projection_gradient)
+        self.assertGreater(float(projection_gradient.abs().sum()), 0.0)
+        self.assertTrue(encoder_gradients)
+        self.assertGreater(
+            sum(float(gradient.abs().sum()) for gradient in encoder_gradients),
+            0.0,
+        )
+
     def test_principal_ablation_switches_construct_and_run(self):
         config = small_config()
         config["model"].update(

@@ -217,6 +217,90 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.matcher.set_temperature(0.0)
 
+    def test_v5_row_softmax_has_strict_mask_and_shared_calibration_support(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        moving, _ = self._represent(torch.rand(1, 1, 32, 32, 32))
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.1,
+            position_weight=0.12,
+            dustbin_mass=0.0,
+            sinkhorn_iterations=3,
+            parent_candidates=2,
+            identity_calibration=True,
+            calibration_gradient=False,
+            coordinate_mode="learned",
+            mutual_transport=False,
+            detach_geometry_cost=True,
+            appearance_weight=0.75,
+            transport_mode="row_softmax",
+            shared_calibration_candidates=True,
+            include_identity_candidate=True,
+        )
+        results = matcher(fixed, moving, extent)
+        for index, result in enumerate(results):
+            plan = result["plan"]
+            row_mass = plan.sum(dim=2)
+            self.assertTrue(
+                torch.allclose(
+                    row_mass,
+                    fixed[index].mass,
+                    atol=1.0e-6,
+                )
+            )
+            self.assertTrue(torch.isfinite(result["support_entropy"]).all())
+            self.assertTrue(torch.all(result["support_entropy"] >= 0.0))
+            self.assertTrue(torch.all(result["support_entropy"] <= 1.0))
+            if index:
+                mask = result["candidate_mask"]
+                reference_mask = result["identity_candidate_mask"]
+                self.assertTrue(torch.equal(mask, reference_mask))
+                self.assertEqual(float(plan.masked_select(~mask).abs().max()), 0.0)
+                diagonal = torch.diagonal(mask, dim1=1, dim2=2)
+                self.assertTrue(bool(diagonal.all()))
+
+    def test_v5_uniform_plan_has_zero_match_evidence(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        fixed = [
+            replace(
+                level,
+                features=torch.zeros_like(level.features),
+                appearance=torch.zeros_like(level.appearance),
+            )
+            for level in fixed
+        ]
+        shift = torch.tensor([[[2.0, -1.0, 0.5]]])
+        moving = [
+            replace(level, centers_mm=level.centers_mm + shift)
+            for level in fixed
+        ]
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.1,
+            position_weight=0.0,
+            scale_weight=0.0,
+            dustbin_mass=0.0,
+            parent_candidates=2,
+            identity_calibration=True,
+            calibration_gradient=False,
+            coordinate_mode="learned",
+            detach_geometry_cost=True,
+            appearance_weight=0.75,
+            transport_mode="row_softmax",
+            shared_calibration_candidates=True,
+            include_identity_candidate=True,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            self.assertTrue(
+                torch.allclose(
+                    result["support_entropy"],
+                    torch.ones_like(result["support_entropy"]),
+                    atol=1.0e-5,
+                )
+            )
+            self.assertLess(float(result["match_evidence"].abs().max()), 1.0e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

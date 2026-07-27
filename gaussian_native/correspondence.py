@@ -26,6 +26,8 @@ class PartialSinkhornMatcher(nn.Module):
         coordinate_mode: str = "learned",
         mutual_transport: bool = False,
         detach_geometry_cost: bool = False,
+        appearance_weight: float = 0.0,
+        transport_mode: str = "sinkhorn",
     ) -> None:
         super().__init__()
         if not 0.0 <= dustbin_mass < 0.5:
@@ -42,6 +44,14 @@ class PartialSinkhornMatcher(nn.Module):
             raise ValueError("coordinate_mode must be learned or canonical")
         self.mutual_transport = bool(mutual_transport)
         self.detach_geometry_cost = bool(detach_geometry_cost)
+        self.appearance_weight = float(appearance_weight)
+        if not 0.0 <= self.appearance_weight <= 1.0:
+            raise ValueError("appearance_weight must lie in [0, 1]")
+        self.transport_mode = str(transport_mode).strip().lower()
+        if self.transport_mode not in {"sinkhorn", "row_softmax"}:
+            raise ValueError("transport_mode must be sinkhorn or row_softmax")
+        if self.transport_mode == "row_softmax" and self.dustbin_mass:
+            raise ValueError("row_softmax requires dustbin_mass=0")
         self.feature_projection = nn.Linear(feature_dim, feature_dim, bias=False)
         self.dustbin_score = nn.Parameter(torch.tensor(-1.0))
 
@@ -95,6 +105,42 @@ class PartialSinkhornMatcher(nn.Module):
             log_v = log_b - torch.logsumexp(augmented + log_u.unsqueeze(2), dim=1)
         return augmented + log_u.unsqueeze(2) + log_v.unsqueeze(1)
 
+    @staticmethod
+    def _standardized_appearance(level: GaussianLevel) -> torch.Tensor:
+        """Return a fixed, per-volume normalized Gaussian appearance descriptor."""
+        appearance = level.appearance.detach().float()
+        mean = appearance.mean(dim=1, keepdim=True)
+        scale = appearance.std(dim=1, keepdim=True, unbiased=False).clamp_min(
+            1.0e-4
+        )
+        standardized = ((appearance - mean) / scale).clamp(-5.0, 5.0)
+        return F.normalize(standardized, dim=-1)
+
+    def _transport(
+        self,
+        logits: torch.Tensor,
+        fixed_mass: torch.Tensor,
+        moving_mass: torch.Tensor,
+        candidate_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.transport_mode == "sinkhorn":
+            return torch.exp(
+                self._log_transport(
+                    logits.float(),
+                    fixed_mass.float(),
+                    moving_mass.float(),
+                )
+            )
+        row_probability = torch.softmax(logits.float(), dim=2)
+        if candidate_mask is not None:
+            row_probability = row_probability * candidate_mask.float()
+            row_probability = row_probability / row_probability.sum(
+                dim=2,
+                keepdim=True,
+            ).clamp_min(1.0e-8)
+        plan = row_probability * fixed_mass.float().unsqueeze(2)
+        return F.pad(plan, (0, 1, 0, 1))
+
     def forward(
         self,
         fixed: GaussianLevel,
@@ -105,6 +151,18 @@ class PartialSinkhornMatcher(nn.Module):
         fixed_feature = F.normalize(self.feature_projection(fixed.features), dim=-1)
         moving_feature = F.normalize(self.feature_projection(moving.features), dim=-1)
         feature_similarity = torch.einsum("bif,bjf->bij", fixed_feature, moving_feature)
+        if self.appearance_weight:
+            fixed_appearance = self._standardized_appearance(fixed)
+            moving_appearance = self._standardized_appearance(moving)
+            if fixed_appearance.shape[-1] != moving_appearance.shape[-1]:
+                raise AssertionError("moving/fixed appearance dimensions must match")
+            appearance_similarity = torch.einsum(
+                "bif,bjf->bij",
+                fixed_appearance,
+                moving_appearance,
+            )
+        else:
+            appearance_similarity = torch.zeros_like(feature_similarity)
         fixed_coordinate = self._coordinates(fixed)
         moving_coordinate = self._coordinates(moving)
         fixed_cost_coordinate = (
@@ -136,19 +194,25 @@ class PartialSinkhornMatcher(nn.Module):
             2
         ) - torch.log(moving_scale.clamp_min(1.0e-3)).unsqueeze(1)
         scale_cost = log_scale_delta.square().mean(dim=-1)
-        cost = 1.0 - feature_similarity + self.position_weight * position_cost
+        feature_cost = 1.0 - feature_similarity
+        appearance_cost = 1.0 - appearance_similarity
+        cost = (
+            (1.0 - self.appearance_weight) * feature_cost
+            + self.appearance_weight * appearance_cost
+            + self.position_weight * position_cost
+        )
         cost = cost + self.scale_weight * scale_cost
         logits = -cost / self.temperature
         if candidate_mask is not None:
             if candidate_mask.shape != logits.shape:
                 raise AssertionError("candidate mask shape must match correspondence logits")
             logits = logits.masked_fill(~candidate_mask, -1.0e4)
-        log_plan = self._log_transport(
-            logits.float(),
-            fixed.mass.float(),
-            moving.mass.float(),
+        full_plan = self._transport(
+            logits,
+            fixed.mass,
+            moving.mass,
+            candidate_mask,
         )
-        full_plan = torch.exp(log_plan)
         plan = full_plan[:, :-1, :-1]
         row_sum = plan.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
         column_sum = plan.sum(dim=1, keepdim=True).clamp_min(1.0e-8)
@@ -167,6 +231,25 @@ class PartialSinkhornMatcher(nn.Module):
         selected_column_plan = (
             mutual_column_plan if self.mutual_transport else column_plan
         )
+        row_entropy = -(
+            selected_row_plan
+            * selected_row_plan.clamp_min(1.0e-8).log()
+        ).sum(dim=2)
+        if candidate_mask is None:
+            support_size = row_entropy.new_full(
+                row_entropy.shape,
+                moving.centers_mm.shape[1],
+            )
+        else:
+            support_size = candidate_mask.sum(dim=2).to(row_entropy.dtype)
+        maximum_entropy = support_size.clamp_min(2.0).log()
+        support_entropy = row_entropy / maximum_entropy
+        support_entropy = torch.where(
+            support_size > 1.0,
+            support_entropy,
+            torch.zeros_like(support_entropy),
+        ).clamp(0.0, 1.0)
+        match_evidence = (1.0 - support_entropy).clamp(0.0, 1.0)
         matched_center = torch.einsum(
             "bij,bjd->bid",
             selected_row_plan,
@@ -220,6 +303,9 @@ class PartialSinkhornMatcher(nn.Module):
             "cycle_error": cycle_error.mean(),
             "transport_cost": transport_cost,
             "mutual_concentration": selected_row_plan.max(dim=2).values.mean(),
+            "support_entropy": support_entropy,
+            "match_evidence": match_evidence,
+            "support_size": support_size,
             "matched_mass_fraction": (
                 plan.sum(dim=2)
                 / ((1.0 - self.dustbin_mass) * fixed.mass.float()).clamp_min(1.0e-8)
@@ -243,6 +329,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         coordinate_mode: str = "learned",
         mutual_transport: bool = False,
         detach_geometry_cost: bool = False,
+        appearance_weight: float = 0.0,
+        transport_mode: str = "sinkhorn",
+        shared_calibration_candidates: bool = False,
+        include_identity_candidate: bool = False,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
@@ -250,6 +340,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         self.identity_calibration = bool(identity_calibration)
         self.calibration_gradient = bool(calibration_gradient)
         self.coordinate_mode = str(coordinate_mode).strip().lower()
+        self.shared_calibration_candidates = bool(
+            shared_calibration_candidates
+        )
+        self.include_identity_candidate = bool(include_identity_candidate)
         self.matchers = nn.ModuleList(
             [
                 PartialSinkhornMatcher(
@@ -262,6 +356,8 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     coordinate_mode=coordinate_mode,
                     mutual_transport=mutual_transport,
                     detach_geometry_cost=detach_geometry_cost,
+                    appearance_weight=appearance_weight,
+                    transport_mode=transport_mode,
                 )
                 for _ in range(3)
             ]
@@ -287,7 +383,6 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         batch, fixed_parents, moving_parents = parent_plan.shape
         count = min(self.parent_candidates, moving_parents)
         normalized = parent_plan / parent_plan.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
-        top = normalized.topk(count, dim=2).indices
         allowed = torch.zeros(
             batch,
             fixed_parents,
@@ -295,9 +390,25 @@ class HierarchicalGaussianCorrespondence(nn.Module):
             dtype=torch.bool,
             device=parent_plan.device,
         )
-        allowed.scatter_(2, top, True)
+        add_identity = (
+            self.include_identity_candidate
+            and fixed_parents == moving_parents
+        )
+        top_count = max(count - 1, 0) if add_identity else count
+        if top_count:
+            top = normalized.topk(top_count, dim=2).indices
+            allowed.scatter_(2, top, True)
+        if add_identity:
+            identity = torch.arange(
+                fixed_parents,
+                device=parent_plan.device,
+            ).view(1, fixed_parents, 1).expand(batch, -1, -1)
+            allowed.scatter_(2, identity, True)
         child_rows = allowed[:, fixed_parent, :]
-        return child_rows[:, :, moving_parent]
+        child_mask = child_rows[:, :, moving_parent]
+        if not bool(child_mask.any(dim=2).all()):
+            raise AssertionError("every fixed child requires a moving candidate")
+        return child_mask
 
     def _hierarchy_error(
         self,
@@ -332,17 +443,40 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         for index, (fixed, moving, matcher) in enumerate(
             zip(fixed_levels, moving_levels, self.matchers)
         ):
+            mask = None
+            if index:
+                if fixed.parent_index is None or moving.parent_index is None:
+                    raise AssertionError("child correspondence requires parent indices")
+                mask = self._candidate_mask(
+                    results[-1]["motion_plan"].detach(),
+                    fixed.parent_index,
+                    moving.parent_index,
+                )
             reference_center = fixed.centers_mm
+            reference_mask = None
             if self.identity_calibration:
-                reference_mask = None
                 if index:
-                    if fixed.parent_index is None or reference_parent_plan is None:
+                    if fixed.parent_index is None:
                         raise AssertionError("self-calibrated child matching requires parents")
-                    reference_mask = self._candidate_mask(
-                        reference_parent_plan,
-                        fixed.parent_index,
-                        fixed.parent_index,
-                    )
+                    if self.shared_calibration_candidates:
+                        if moving.parent_index is None or not torch.equal(
+                            fixed.parent_index,
+                            moving.parent_index,
+                        ):
+                            raise AssertionError(
+                                "shared calibration requires aligned hierarchy indices"
+                            )
+                        reference_mask = mask
+                    else:
+                        if reference_parent_plan is None:
+                            raise AssertionError(
+                                "legacy self-calibration requires a parent plan"
+                            )
+                        reference_mask = self._candidate_mask(
+                            reference_parent_plan,
+                            fixed.parent_index,
+                            fixed.parent_index,
+                        )
                 # Subtract the fixed-to-fixed transport barycentre to remove
                 # entropic matching bias. V3 keeps this path differentiable so
                 # identical cross/self transports cancel in both value and
@@ -365,17 +499,9 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     else reference["matched_center_mm"]
                 )
                 reference_parent_plan = reference["motion_plan"]
-            mask = None
-            if index:
-                if fixed.parent_index is None or moving.parent_index is None:
-                    raise AssertionError("child correspondence requires parent indices")
-                mask = self._candidate_mask(
-                    results[-1]["motion_plan"].detach(),
-                    fixed.parent_index,
-                    moving.parent_index,
-                )
             result = matcher(fixed, moving, extent_mm, candidate_mask=mask)
             result["candidate_mask"] = mask
+            result["identity_candidate_mask"] = reference_mask
             matched_coordinate = (
                 result["matched_anchor_center_mm"]
                 if self.coordinate_mode == "canonical"

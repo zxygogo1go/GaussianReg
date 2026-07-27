@@ -16,7 +16,11 @@ from experiment_utils import (
 )
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from model import SACB_Net
-from train_registration import _augment_pair, _collapse_warning
+from train_registration import (
+    _augment_pair,
+    _collapse_warning,
+    _fail_fast_reason,
+)
 
 
 class ExperimentUtilityTests(unittest.TestCase):
@@ -129,6 +133,46 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(configure_model_for_epoch(model, config, 5), 0.1)
         self.assertAlmostEqual(model.correspondence.temperature, 0.1)
 
+    def test_v5_builder_uses_appearance_row_matching_and_evidence(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v5",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "transport_mode": "row_softmax",
+                "appearance_weight": 0.75,
+                "dustbin_mass": 0.0,
+                "motion_mode": "translation",
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v5")
+        self.assertTrue(model.correspondence.shared_calibration_candidates)
+        self.assertTrue(model.correspondence.include_identity_candidate)
+        for matcher in model.correspondence.matchers:
+            self.assertEqual(matcher.transport_mode, "row_softmax")
+            self.assertAlmostEqual(matcher.appearance_weight, 0.75)
+            self.assertTrue(matcher.detach_geometry_cost)
+            self.assertFalse(matcher.mutual_transport)
+        self.assertTrue(model.velocity_head.use_match_evidence)
+        self.assertEqual(model.velocity_head.motion_mode, "translation")
+        self.assertTrue(model.velocity_synthesis.rasterizer.use_canonical_basis)
+
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {
             "model": {
@@ -171,6 +215,38 @@ class ExperimentUtilityTests(unittest.TestCase):
             _collapse_warning(10, healthy_motion, validation),
             "",
         )
+
+    def test_fail_fast_monitor_detects_repeated_negative_validation(self):
+        history = [
+            {
+                "train": {
+                    "support_entropy_l0": 0.9,
+                    "row_max_probability_l0": 0.1,
+                },
+                "validation": {
+                    "ncc_after": 0.18,
+                    "ncc_improvement": -0.03,
+                    "dice_improvement": -0.01,
+                    "negative_jacobian_ratio": 0.0,
+                    "p95_displacement_mm": 5.0,
+                },
+            }
+            for _ in range(3)
+        ]
+        config = {
+            "monitoring": {
+                "fail_fast_enabled": True,
+                "fail_fast_start_epoch": 3,
+                "fail_fast_patience": 3,
+                "recent_mean_ncc_floor": -0.02,
+            }
+        }
+        self.assertIn(
+            "mean NCC improvement",
+            _fail_fast_reason(3, history, config),
+        )
+        config["monitoring"]["fail_fast_enabled"] = False
+        self.assertEqual(_fail_fast_reason(3, history, config), "")
 
     def test_pair_augmentation_preserves_shape_and_range(self):
         torch.manual_seed(9)

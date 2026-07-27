@@ -44,6 +44,7 @@ class GaussianVelocityHead(nn.Module):
         max_strain: float = 0.08,
         motion_mode: str = "affine",
         hierarchy_mode: str = "soft_residual",
+        use_match_evidence: bool = False,
     ) -> None:
         super().__init__()
         self.children_per_parent = int(children_per_parent)
@@ -88,6 +89,7 @@ class GaussianVelocityHead(nn.Module):
         self.hierarchy_mode = str(hierarchy_mode).strip().lower()
         if self.hierarchy_mode not in {"hard_centered", "soft_residual"}:
             raise ValueError("hierarchy_mode must be hard_centered or soft_residual")
+        self.use_match_evidence = bool(use_match_evidence)
         input_dim = 2 * feature_dim + 15
         self.level_embedding = nn.Parameter(torch.zeros(3, feature_dim))
         nn.init.normal_(self.level_embedding, std=0.02)
@@ -202,6 +204,16 @@ class GaussianVelocityHead(nn.Module):
                 if "transport_delta_mm" not in match:
                     raise KeyError("soft_residual velocity requires calibrated transport displacement")
                 calibrated_delta = match["transport_delta_mm"]
+                if self.use_match_evidence:
+                    if "match_evidence" not in match:
+                        raise KeyError(
+                            "evidence-weighted velocity requires match_evidence"
+                        )
+                    motion_evidence = match["match_evidence"].unsqueeze(-1)
+                else:
+                    motion_evidence = torch.ones_like(
+                        calibrated_delta[..., :1]
+                    )
                 if level_index:
                     if fixed.parent_index is None:
                         raise AssertionError("child velocity requires parent indices")
@@ -214,17 +226,24 @@ class GaussianVelocityHead(nn.Module):
                 calibrated_deltas.append(calibrated_delta)
                 direct_translation = (
                     self.direct_displacement_fractions[level_index]
+                    * motion_evidence
                     * self._bounded_vector(
                         calibrated_residual,
                         fixed.scales_mm,
                         level_index,
                     )
                 )
-                learned_translation = translation_residual
+                learned_translation = motion_evidence * translation_residual
                 rotation_vector = (
-                    torch.tanh(raw[..., 3:6]) * self.max_rotation_radians
+                    motion_evidence
+                    * torch.tanh(raw[..., 3:6])
+                    * self.max_rotation_radians
                 )
-                strain_parameters = torch.tanh(raw[..., 6:12]) * self.max_strain
+                strain_parameters = (
+                    motion_evidence
+                    * torch.tanh(raw[..., 6:12])
+                    * self.max_strain
+                )
             translation = learned_translation + direct_translation
             if self.motion_mode == "translation":
                 rotation_vector = torch.zeros_like(rotation_vector)

@@ -23,7 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v4_hntsmrg24.json",
+        default="configs/gaussian_native_v5_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -90,6 +90,10 @@ def main() -> None:
             or name.startswith(
                 (
                     "match_entropy_",
+                    "support_entropy_",
+                    "match_evidence_",
+                    "row_max_probability_",
+                    "support_size_",
                     "diagonal_probability_",
                     "transport_delta_",
                     "direct_translation_",

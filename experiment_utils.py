@@ -216,6 +216,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
     stable_motion_basis = architecture_revision in {
         "gaussian_native_v3",
         "gaussian_native_v4",
+        "gaussian_native_v5",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -251,6 +252,8 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         integration_mode=str(model.get("integration_mode", "svf")),
         covariance_mode=str(model.get("covariance_mode", "full")),
         architecture_revision=architecture_revision,
+        appearance_weight=float(model.get("appearance_weight", 0.0)),
+        transport_mode=str(model.get("transport_mode", "sinkhorn")),
         direct_displacement_fractions=tuple(
             float(value)
             for value in model.get(
@@ -414,6 +417,21 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
         diagnostics["mutual_concentration_l%d" % index] = float(
             result["mutual_concentration"].detach().float().cpu()
         )
+        diagnostics["row_max_probability_l%d" % index] = diagnostics[
+            "mutual_concentration_l%d" % index
+        ]
+        if "support_entropy" in result:
+            diagnostics["support_entropy_l%d" % index] = float(
+                result["support_entropy"].detach().float().mean().cpu()
+            )
+        if "match_evidence" in result:
+            diagnostics["match_evidence_l%d" % index] = float(
+                result["match_evidence"].detach().float().mean().cpu()
+            )
+        if "support_size" in result:
+            diagnostics["support_size_l%d" % index] = float(
+                result["support_size"].detach().float().mean().cpu()
+            )
         if plan.shape[1] == plan.shape[2]:
             diagnostics["diagonal_probability_l%d" % index] = float(
                 torch.diagonal(row, dim1=1, dim2=2).mean().cpu()

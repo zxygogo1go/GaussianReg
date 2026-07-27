@@ -7,7 +7,7 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -391,6 +391,127 @@ def _collapse_warning(
     return "\n".join(warnings)
 
 
+def _fail_fast_reason(
+    epoch: int,
+    history: Sequence[Mapping[str, Mapping[str, float]]],
+    config: Mapping[str, object],
+) -> str:
+    """Return a reproducible failure reason for a clearly non-viable run."""
+    monitoring = dict(config.get("monitoring", {}))
+    if not bool(monitoring.get("fail_fast_enabled", False)) or not history:
+        return ""
+    current_validation = history[-1]["validation"]
+    finite_names = (
+        "ncc_after",
+        "ncc_improvement",
+        "negative_jacobian_ratio",
+        "p95_displacement_mm",
+    )
+    for name in finite_names:
+        value = float(current_validation.get(name, float("nan")))
+        if not np.isfinite(value):
+            return "non-finite validation metric: %s" % name
+    folding = float(current_validation["negative_jacobian_ratio"])
+    maximum_folding = float(
+        monitoring.get("maximum_negative_jacobian_ratio", 0.02)
+    )
+    if folding > maximum_folding:
+        return (
+            "negative Jacobian ratio %.5f exceeds %.5f"
+            % (folding, maximum_folding)
+        )
+
+    patience = int(monitoring.get("fail_fast_patience", 3))
+    start_epoch = int(monitoring.get("fail_fast_start_epoch", 5))
+    if patience <= 0 or start_epoch <= 0:
+        raise ValueError("fail-fast patience and start epoch must be positive")
+    recent = list(history[-patience:])
+    if epoch >= start_epoch and len(recent) == patience:
+        ncc_values = np.asarray(
+            [
+                float(item["validation"].get("ncc_improvement", float("nan")))
+                for item in recent
+            ],
+            dtype=np.float64,
+        )
+        dice_values = np.asarray(
+            [
+                float(item["validation"].get("dice_improvement", float("nan")))
+                for item in recent
+            ],
+            dtype=np.float64,
+        )
+        ncc_floor = float(
+            monitoring.get("recent_mean_ncc_floor", -0.02)
+        )
+        dice_floor = float(
+            monitoring.get("recent_mean_dice_floor", -0.03)
+        )
+        if np.isfinite(ncc_values).all() and float(ncc_values.mean()) < ncc_floor:
+            return (
+                "recent %d-validation mean NCC improvement %.5f is below %.5f"
+                % (patience, float(ncc_values.mean()), ncc_floor)
+            )
+        if np.isfinite(dice_values).all() and float(dice_values.mean()) < dice_floor:
+            return (
+                "recent %d-validation mean Dice improvement %.5f is below %.5f"
+                % (patience, float(dice_values.mean()), dice_floor)
+            )
+
+        entropy_threshold = float(
+            monitoring.get("uniform_entropy_threshold", 0.985)
+        )
+        row_maximum_threshold = float(
+            monitoring.get("uniform_row_maximum_threshold", 0.04)
+        )
+        uniform = all(
+            float(
+                item["train"].get(
+                    "support_entropy_l0",
+                    float("nan"),
+                )
+            )
+            > entropy_threshold
+            and float(
+                item["train"].get(
+                    "row_max_probability_l0",
+                    float("nan"),
+                )
+            )
+            < row_maximum_threshold
+            and float(
+                item["validation"].get(
+                    "ncc_improvement",
+                    float("nan"),
+                )
+            )
+            <= 0.0
+            for item in recent
+        )
+        if uniform:
+            return (
+                "coarse correspondence remained uniform for %d validations"
+                % patience
+            )
+
+    finite_gains = [
+        float(item["validation"].get("ncc_improvement", float("nan")))
+        for item in history
+    ]
+    finite_gains = [value for value in finite_gains if np.isfinite(value)]
+    best_gain = max(finite_gains, default=-float("inf"))
+    for threshold in monitoring.get("progress_thresholds", ()):
+        threshold = dict(threshold)
+        threshold_epoch = int(threshold["epoch"])
+        minimum_gain = float(threshold["minimum_best_ncc_improvement"])
+        if epoch == threshold_epoch and best_gain <= minimum_gain:
+            return (
+                "best NCC improvement %.5f did not exceed %.5f at epoch %d"
+                % (best_gain, minimum_gain, epoch)
+            )
+    return ""
+
+
 def _checkpoint(
     epoch: int,
     model: torch.nn.Module,
@@ -585,6 +706,8 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     checkpoint_every = int(optimization.get("checkpoint_every", 25))
     gradient_clip = float(optimization.get("gradient_clip", 5.0))
     log_every = int(optimization.get("log_every", 10))
+    monitoring = dict(config.get("monitoring", {}))
+    validation_history = []
     if validate_every <= 0 or checkpoint_every <= 0 or gradient_clip <= 0.0 or log_every <= 0:
         raise ValueError("validation/checkpoint/log intervals and gradient_clip must be positive")
     try:
@@ -623,6 +746,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     amp,
                     amp_dtype,
                 )
+                validation_history.append(
+                    {
+                        "train": dict(train_metrics),
+                        "validation": dict(validation_metrics),
+                    }
+                )
             scheduler.step()
             record = {
                 "epoch": epoch,
@@ -638,7 +767,43 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             writer.add_scalar("optimization/learning_rate", lr, epoch)
 
             score = float(validation_metrics.get("ncc_after", -float("inf")))
-            improved = np.isfinite(score) and score > best_validation_ncc
+            ncc_gain = float(
+                validation_metrics.get(
+                    "ncc_improvement",
+                    float("nan"),
+                )
+            )
+            folding = float(
+                validation_metrics.get(
+                    "negative_jacobian_ratio",
+                    float("nan"),
+                )
+            )
+            eligible = True
+            if monitoring:
+                eligible = (
+                    np.isfinite(ncc_gain)
+                    and ncc_gain
+                    > float(
+                        monitoring.get(
+                            "best_checkpoint_minimum_ncc_improvement",
+                            -float("inf"),
+                        )
+                    )
+                    and np.isfinite(folding)
+                    and folding
+                    <= float(
+                        monitoring.get(
+                            "best_checkpoint_maximum_negative_jacobian_ratio",
+                            float("inf"),
+                        )
+                    )
+                )
+            improved = (
+                eligible
+                and np.isfinite(score)
+                and score > best_validation_ncc
+            )
             if improved:
                 best_validation_ncc = score
             state = _checkpoint(
@@ -666,8 +831,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             )
             print(
                 "epoch %d complete lr=%.3e match_temp=%s val_ncc=%s "
-                "val_dice=%s val_p95_mm=%s h0=%.4f diag0=%.4f "
-                "delta0_mm=%.3f ncc_gain=%.5f dice_gain=%.5f "
+                "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
+                "evidence=%.4f/%.4f/%.4f diag0=%.4f delta0_mm=%.3f "
+                "ncc_gain=%.5f dice_gain=%.5f "
                 "fold=%.6f best=%.5f"
                 % (
                     epoch,
@@ -684,7 +850,37 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     else "not-run",
                     float(
                         train_metrics.get(
-                            "match_entropy_l0",
+                            "support_entropy_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "support_entropy_l1",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "support_entropy_l2",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "match_evidence_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "match_evidence_l1",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "match_evidence_l2",
                             float("nan"),
                         )
                     ),
@@ -728,6 +924,20 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             )
             if warning:
                 print(warning)
+            fail_reason = _fail_fast_reason(
+                epoch,
+                validation_history,
+                config,
+            )
+            if fail_reason:
+                failed_state = dict(state)
+                failed_state["failure_reason"] = fail_reason
+                atomic_torch_save(
+                    failed_state,
+                    output_dir / ("failed_epoch_%04d.pt" % epoch),
+                )
+                print("training stopped by fail-fast monitor: %s" % fail_reason)
+                break
     finally:
         writer.close()
 
