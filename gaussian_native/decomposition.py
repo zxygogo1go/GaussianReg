@@ -329,9 +329,15 @@ class HierarchicalGaussianDecomposer(nn.Module):
         batch = measurements.shape[0]
         lattice = self.root_lattice.to(device=measurements.device, dtype=torch.float32)
         lattice = lattice.unsqueeze(0).expand(batch, -1, -1)
-        centers = normalized_to_physical(lattice, extent_mm)
+        anchor_centers = normalized_to_physical(lattice, extent_mm)
         cell = extent_mm / extent_mm.new_tensor(self.root_grid_shape).view(1, 3)
-        scales = 0.55 * cell.unsqueeze(1).expand(-1, centers.shape[1], -1)
+        anchor_scales = 0.55 * cell.unsqueeze(1).expand(
+            -1,
+            anchor_centers.shape[1],
+            -1,
+        )
+        centers = anchor_centers
+        scales = anchor_scales
         rotations = torch.eye(3, device=centers.device, dtype=centers.dtype).view(
             1, 1, 3, 3
         ).expand(batch, centers.shape[1], -1, -1)
@@ -373,6 +379,8 @@ class HierarchicalGaussianDecomposer(nn.Module):
             features=features,
             appearance=refined,
             parent_index=None,
+            anchor_centers_mm=anchor_centers,
+            anchor_scales_mm=anchor_scales,
         )
 
     def _child_level(
@@ -392,10 +400,18 @@ class HierarchicalGaussianDecomposer(nn.Module):
         parent_scale = parent.scales_mm[:, parent_index]
         parent_rotation = parent.rotations[:, parent_index]
         parent_feature = parent.features[:, parent_index]
+        if parent.anchor_centers_mm is None or parent.anchor_scales_mm is None:
+            raise AssertionError("canonical parent anchors are required")
+        anchor_parent_center = parent.anchor_centers_mm[:, parent_index]
+        anchor_parent_scale = parent.anchor_scales_mm[:, parent_index]
         offsets = self.child_offsets.to(
             device=parent_center.device,
             dtype=parent_center.dtype,
         ).repeat(parent_nodes, 1)
+        anchor_offset = offsets.view(1, parent_nodes * children, 3)
+        anchor_offset = anchor_offset * anchor_parent_scale * 0.72
+        anchor_centers = anchor_parent_center + anchor_offset
+        anchor_scales = anchor_parent_scale * 0.56
         local_offset = offsets.view(1, parent_nodes * children, 3) * parent_scale * 0.72
         world_offset = torch.einsum(
             "bkij,bkj->bki",
@@ -464,6 +480,8 @@ class HierarchicalGaussianDecomposer(nn.Module):
             features=features,
             appearance=refined,
             parent_index=parent_index,
+            anchor_centers_mm=anchor_centers,
+            anchor_scales_mm=anchor_scales,
         )
 
     def forward(

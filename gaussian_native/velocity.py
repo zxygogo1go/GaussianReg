@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 from torch import nn
@@ -35,9 +35,11 @@ class GaussianVelocityHead(nn.Module):
         hidden_dim: int = 192,
         children_per_parent: int = 4,
         translation_fraction: float = 0.40,
+        learned_translation_fractions: Optional[Sequence[float]] = None,
         correspondence_fraction: float = 0.0,
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
         direct_displacement_limit: float = 1.5,
+        direct_displacement_limits_mm: Optional[Sequence[float]] = None,
         max_rotation_radians: float = 0.20,
         max_strain: float = 0.08,
         motion_mode: str = "affine",
@@ -46,6 +48,16 @@ class GaussianVelocityHead(nn.Module):
         super().__init__()
         self.children_per_parent = int(children_per_parent)
         self.translation_fraction = float(translation_fraction)
+        self.learned_translation_fractions = (
+            (self.translation_fraction,) * 3
+            if learned_translation_fractions is None
+            else tuple(float(value) for value in learned_translation_fractions)
+        )
+        if (
+            len(self.learned_translation_fractions) != 3
+            or any(value < 0.0 for value in self.learned_translation_fractions)
+        ):
+            raise ValueError("learned_translation_fractions must contain three nonnegative values")
         self.correspondence_fraction = float(correspondence_fraction)
         self.direct_displacement_fractions = tuple(
             float(value) for value in direct_displacement_fractions
@@ -58,6 +70,16 @@ class GaussianVelocityHead(nn.Module):
         self.direct_displacement_limit = float(direct_displacement_limit)
         if self.direct_displacement_limit <= 0.0:
             raise ValueError("direct_displacement_limit must be positive")
+        self.direct_displacement_limits_mm = (
+            None
+            if direct_displacement_limits_mm is None
+            else tuple(float(value) for value in direct_displacement_limits_mm)
+        )
+        if self.direct_displacement_limits_mm is not None and (
+            len(self.direct_displacement_limits_mm) != 3
+            or any(value <= 0.0 for value in self.direct_displacement_limits_mm)
+        ):
+            raise ValueError("direct_displacement_limits_mm must contain three positive values")
         self.max_rotation_radians = float(max_rotation_radians)
         self.max_strain = float(max_strain)
         self.motion_mode = str(motion_mode).strip().lower()
@@ -93,7 +115,13 @@ class GaussianVelocityHead(nn.Module):
         self,
         value: torch.Tensor,
         scale: torch.Tensor,
+        level_index: int,
     ) -> torch.Tensor:
+        if self.direct_displacement_limits_mm is not None:
+            length = torch.linalg.vector_norm(value, dim=-1, keepdim=True)
+            limit = self.direct_displacement_limits_mm[level_index]
+            factor = (limit / length.clamp_min(1.0e-6)).clamp(max=1.0)
+            return value * factor
         normalized = value / scale.clamp_min(1.0e-3)
         length = torch.linalg.vector_norm(normalized, dim=-1, keepdim=True)
         factor = (self.direct_displacement_limit / length.clamp_min(1.0e-6)).clamp(
@@ -110,12 +138,18 @@ class GaussianVelocityHead(nn.Module):
         calibrated_deltas = []
         for level_index, (fixed, match) in enumerate(zip(fixed_levels, correspondence)):
             delta = match["matched_center_mm"] - fixed.centers_mm
+            motion_scale = fixed.scales_mm
+            if (
+                self.direct_displacement_limits_mm is not None
+                and getattr(fixed, "anchor_scales_mm", None) is not None
+            ):
+                motion_scale = fixed.anchor_scales_mm
             motion_delta = (
                 match["transport_delta_mm"]
                 if self.hierarchy_mode == "soft_residual"
                 else delta
             )
-            normalized_delta = motion_delta / fixed.scales_mm.clamp_min(1.0e-3)
+            normalized_delta = motion_delta / motion_scale.clamp_min(1.0e-3)
             log_scale_ratio = torch.log(
                 match["matched_scale_mm"].clamp_min(1.0e-3)
                 / fixed.scales_mm.clamp_min(1.0e-3)
@@ -141,8 +175,8 @@ class GaussianVelocityHead(nn.Module):
             raw = self.network(inputs)
             translation_residual = (
                 torch.tanh(raw[..., 0:3])
-                * fixed.scales_mm
-                * self.translation_fraction
+                * motion_scale
+                * self.learned_translation_fractions[level_index]
             )
             if self.hierarchy_mode == "hard_centered" and level_index == 0:
                 bounded_delta = torch.maximum(
@@ -180,7 +214,11 @@ class GaussianVelocityHead(nn.Module):
                 calibrated_deltas.append(calibrated_delta)
                 direct_translation = (
                     self.direct_displacement_fractions[level_index]
-                    * self._bounded_vector(calibrated_residual, fixed.scales_mm)
+                    * self._bounded_vector(
+                        calibrated_residual,
+                        fixed.scales_mm,
+                        level_index,
+                    )
                 )
                 learned_translation = translation_residual
                 rotation_vector = (
@@ -210,10 +248,16 @@ class GaussianVelocityHead(nn.Module):
 class GaussianVelocityRasterizer(nn.Module):
     """Synthesize a dense physical SVF from local Gaussian affine velocities."""
 
-    def __init__(self, node_chunk: int = 64, cutoff_sigma: float = 3.5) -> None:
+    def __init__(
+        self,
+        node_chunk: int = 64,
+        cutoff_sigma: float = 3.5,
+        use_canonical_basis: bool = False,
+    ) -> None:
         super().__init__()
         self.node_chunk = int(node_chunk)
         self.cutoff_squared = float(cutoff_sigma) ** 2
+        self.use_canonical_basis = bool(use_canonical_basis)
 
     def forward(
         self,
@@ -227,14 +271,24 @@ class GaussianVelocityRasterizer(nn.Module):
         numerator = grid.new_zeros(batch, voxels, 3)
         denominator = grid.new_zeros(batch, voxels)
         nodes = int(level.centers_mm.shape[1])
-        scaled_mass = level.mass.float() * float(nodes)
+        if self.use_canonical_basis:
+            if level.anchor_centers_mm is None or level.anchor_scales_mm is None:
+                raise AssertionError("canonical velocity synthesis requires anchors")
+            centers = level.anchor_centers_mm.float()
+            inverse_variance = level.anchor_scales_mm.float().clamp_min(1.0e-3).square().reciprocal()
+            precision = torch.diag_embed(inverse_variance)
+            scaled_mass = level.mass.new_ones(batch, nodes, dtype=torch.float32)
+        else:
+            centers = level.centers_mm.float()
+            precision = level.precision_mm2.float()
+            scaled_mass = level.mass.float() * float(nodes)
         for start in range(0, nodes, self.node_chunk):
             stop = min(start + self.node_chunk, nodes)
-            delta = grid.unsqueeze(1) - level.centers_mm[:, start:stop].float().unsqueeze(2)
+            delta = grid.unsqueeze(1) - centers[:, start:stop].unsqueeze(2)
             mahalanobis = torch.einsum(
                 "bcvi,bcij,bcvj->bcv",
                 delta,
-                level.precision_mm2[:, start:stop].float(),
+                precision[:, start:stop],
                 delta,
             )
             weights = torch.exp(-0.5 * mahalanobis)
@@ -261,11 +315,17 @@ class GaussianVelocityRasterizer(nn.Module):
 class HierarchicalGaussianVelocitySynthesis(nn.Module):
     """Fixed additive coarse-to-fine Gaussian velocity hierarchy."""
 
-    def __init__(self, node_chunk: int = 64, cutoff_sigma: float = 3.5) -> None:
+    def __init__(
+        self,
+        node_chunk: int = 64,
+        cutoff_sigma: float = 3.5,
+        use_canonical_basis: bool = False,
+    ) -> None:
         super().__init__()
         self.rasterizer = GaussianVelocityRasterizer(
             node_chunk=node_chunk,
             cutoff_sigma=cutoff_sigma,
+            use_canonical_basis=use_canonical_basis,
         )
 
     def forward(

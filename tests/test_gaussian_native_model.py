@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -37,6 +38,42 @@ def small_config():
 
 
 class GaussianNativeModelTests(unittest.TestCase):
+    def test_v3_canonical_rasterization_ignores_learned_geometry_drift(self):
+        model = build_model(small_config())
+        volume = torch.rand(1, 1, 32, 32, 32)
+        with torch.no_grad():
+            decomposition = model.decomposer(
+                volume,
+                torch.tensor([[1.5, 1.5, 1.5]]),
+                compute_reconstruction=False,
+            )
+        level = decomposition["levels"][0]
+        nodes = int(level.centers_mm.shape[1])
+        translation = torch.randn(1, nodes, 3)
+        motion = SimpleNamespace(
+            translation_mm=translation,
+            linear=torch.zeros(1, nodes, 3, 3),
+        )
+        rasterizer = model.velocity_synthesis.rasterizer
+        field, _ = rasterizer(
+            level,
+            motion,
+            output_shape=(8, 8, 8),
+            extent_mm=decomposition["extent_mm"],
+        )
+        drifted = replace(
+            level,
+            centers_mm=level.centers_mm + 25.0,
+            mass=torch.softmax(torch.randn_like(level.mass), dim=1),
+        )
+        drifted_field, _ = rasterizer(
+            drifted,
+            motion,
+            output_shape=(8, 8, 8),
+            extent_mm=decomposition["extent_mm"],
+        )
+        self.assertTrue(torch.allclose(field, drifted_field, atol=1.0e-6))
+
     def test_v2_child_transport_is_additive_not_hard_centered(self):
         feature_dim = 8
         head = GaussianVelocityHead(
@@ -117,6 +154,31 @@ class GaussianNativeModelTests(unittest.TestCase):
             ),
             0.0,
         )
+
+        bounded_head = GaussianVelocityHead(
+            feature_dim=feature_dim,
+            hidden_dim=16,
+            children_per_parent=4,
+            motion_mode="translation",
+            hierarchy_mode="soft_residual",
+            direct_displacement_fractions=(1.0, 1.0, 1.0),
+            direct_displacement_limits_mm=(2.0, 1.0, 0.5),
+            learned_translation_fractions=(0.0, 0.0, 0.0),
+        )
+        large_matches = []
+        for match in matches:
+            large_match = dict(match)
+            large_match["transport_delta_mm"] = (
+                10.0 * match["transport_delta_mm"]
+            )
+            large_matches.append(large_match)
+        bounded = bounded_head(levels, large_matches)
+        for motion, limit in zip(bounded, (2.0, 1.0, 0.5)):
+            norm = torch.linalg.vector_norm(
+                motion.direct_translation_mm,
+                dim=-1,
+            )
+            self.assertLessEqual(float(norm.detach().max()), limit + 1.0e-5)
 
     def test_principal_ablation_switches_construct_and_run(self):
         config = small_config()

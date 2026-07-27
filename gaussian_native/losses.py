@@ -104,6 +104,9 @@ class GaussianNativeObjective(nn.Module):
         self.ngf_weight = float(config.get("ngf_weight", 0.15))
         self.coverage_weight = float(config.get("coverage_weight", 0.10))
         self.containment_weight = float(config.get("containment_weight", 0.10))
+        self.anchor_offset_weight = float(config.get("anchor_offset_weight", 0.0))
+        if self.anchor_offset_weight < 0.0:
+            raise ValueError("anchor_offset_weight must be nonnegative")
         self.cycle_weight = float(config.get("cycle_weight", 0.50))
         self.hierarchy_weight = float(config.get("hierarchy_weight", 0.50))
         self.inverse_weight = float(config.get("inverse_weight", 0.50))
@@ -172,9 +175,20 @@ class GaussianNativeObjective(nn.Module):
         representation = sum(losses) / float(len(losses))
 
         containment = representation.new_zeros(())
+        anchor_offset = representation.new_zeros(())
         count = 0
+        anchor_count = 0
         for key in ("moving_decomposition", "fixed_decomposition"):
             levels = output[key]["levels"]
+            for level in levels:
+                if level.anchor_centers_mm is None or level.anchor_scales_mm is None:
+                    continue
+                normalized_anchor_offset = (
+                    (level.centers_mm - level.anchor_centers_mm)
+                    / level.anchor_scales_mm.clamp_min(1.0e-3)
+                )
+                anchor_offset = anchor_offset + normalized_anchor_offset.square().mean()
+                anchor_count += 1
             for child, parent in zip(levels[1:], levels[:-1]):
                 parent_index = child.parent_index
                 parent_center = parent.centers_mm[:, parent_index]
@@ -194,7 +208,13 @@ class GaussianNativeObjective(nn.Module):
                 ).square().mean()
                 containment = containment + center_penalty + scale_penalty
                 count += 1
-        return representation + self.containment_weight * containment / float(max(count, 1))
+        return (
+            representation
+            + self.containment_weight * containment / float(max(count, 1))
+            + self.anchor_offset_weight
+            * anchor_offset
+            / float(max(anchor_count, 1))
+        )
 
     def _correspondence(self, output: Mapping[str, object]) -> torch.Tensor:
         results = output["correspondence"]

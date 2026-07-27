@@ -55,6 +55,40 @@ class GaussianNativeGeometryTests(unittest.TestCase):
             grouped = child.mass.reshape(1, parent.mass.shape[1], 4).sum(dim=-1)
             self.assertTrue(torch.allclose(grouped, parent.mass, atol=1.0e-6))
 
+    def test_canonical_anchors_do_not_follow_learned_geometry(self):
+        decomposer = HierarchicalGaussianDecomposer(
+            root_grid_shape=(2, 2, 2),
+            feature_dim=24,
+            hidden_dim=32,
+            pyramid_factors=(8, 4, 2),
+            samples_per_axis=2,
+            raster_chunk=16,
+        )
+        with torch.no_grad():
+            decomposer.root_geometry.geometry.bias[0] = 1.0
+            decomposer.child_geometry[0].geometry.bias[1] = -1.0
+        result = decomposer(
+            torch.rand(1, 1, 32, 32, 32),
+            torch.tensor([[1.5, 1.5, 1.5]]),
+            compute_reconstruction=False,
+        )
+        for level in result["levels"]:
+            self.assertIsNotNone(level.anchor_centers_mm)
+            self.assertIsNotNone(level.anchor_scales_mm)
+            self.assertFalse(level.anchor_centers_mm.requires_grad)
+        self.assertFalse(
+            torch.allclose(
+                result["levels"][0].centers_mm,
+                result["levels"][0].anchor_centers_mm,
+            )
+        )
+        self.assertFalse(
+            torch.allclose(
+                result["levels"][1].centers_mm,
+                result["levels"][1].anchor_centers_mm,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

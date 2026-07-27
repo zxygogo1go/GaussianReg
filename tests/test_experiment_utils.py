@@ -80,7 +80,14 @@ class ExperimentUtilityTests(unittest.TestCase):
                 "integration_steps": 3,
             },
         }
-        self.assertIsInstance(build_model(config), GaussianNativeRegistration)
+        model = build_model(config)
+        self.assertIsInstance(model, GaussianNativeRegistration)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v3")
+        self.assertTrue(model.correspondence.calibration_gradient)
+        self.assertEqual(model.correspondence.coordinate_mode, "canonical")
+        self.assertTrue(
+            model.velocity_synthesis.rasterizer.use_canonical_basis
+        )
 
     def test_pair_augmentation_preserves_shape_and_range(self):
         torch.manual_seed(9)
@@ -105,6 +112,27 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertGreaterEqual(float(augmented_moving.min()), 0.0)
         self.assertLessEqual(float(augmented_moving.max()), 1.0)
         self.assertFalse(torch.equal(augmented_moving, moving))
+
+    def test_shared_intensity_augmentation_preserves_pair_photometry(self):
+        torch.manual_seed(17)
+        volume = torch.linspace(0.0, 1.0, 64).reshape(1, 1, 4, 4, 4)
+        augmented_moving, augmented_fixed = _augment_pair(
+            volume,
+            volume.clone(),
+            {
+                "enabled": True,
+                "reverse_pair_probability": 0.0,
+                "shared_flip_probability": 0.0,
+                "intensity_probability": 1.0,
+                "intensity_pair_mode": "shared",
+                "gamma_range": [0.8, 1.2],
+                "scale_range": [0.9, 1.1],
+                "shift_range": [-0.1, 0.1],
+                "noise_std_range": [0.0, 0.0],
+            },
+        )
+        self.assertTrue(torch.equal(augmented_moving, augmented_fixed))
+        self.assertFalse(torch.equal(augmented_moving, volume))
 
 
 if __name__ == "__main__":

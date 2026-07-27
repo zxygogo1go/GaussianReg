@@ -84,21 +84,47 @@ def _augment_intensity(
     volume: torch.Tensor,
     config: Mapping[str, object],
 ) -> torch.Tensor:
+    transform = _sample_intensity_transform(volume, config)
+    return _apply_intensity_transform(volume, transform)
+
+
+def _sample_intensity_transform(
+    reference: torch.Tensor,
+    config: Mapping[str, object],
+) -> Dict[str, torch.Tensor]:
     probability = float(config.get("intensity_probability", 0.0))
-    if probability <= 0.0 or float(torch.rand((), device=volume.device)) >= probability:
-        return volume
+    if probability <= 0.0 or float(torch.rand((), device=reference.device)) >= probability:
+        return {}
     gamma_low, gamma_high = (float(value) for value in config.get("gamma_range", (1.0, 1.0)))
     scale_low, scale_high = (float(value) for value in config.get("scale_range", (1.0, 1.0)))
     shift_low, shift_high = (float(value) for value in config.get("shift_range", (0.0, 0.0)))
     noise_low, noise_high = (float(value) for value in config.get("noise_std_range", (0.0, 0.0)))
     if gamma_low <= 0.0 or gamma_high < gamma_low or scale_high < scale_low:
         raise ValueError("invalid intensity augmentation ranges")
-    gamma = gamma_low + (gamma_high - gamma_low) * torch.rand((), device=volume.device)
-    scale = scale_low + (scale_high - scale_low) * torch.rand((), device=volume.device)
-    shift = shift_low + (shift_high - shift_low) * torch.rand((), device=volume.device)
-    noise_std = noise_low + (noise_high - noise_low) * torch.rand((), device=volume.device)
+    return {
+        "gamma": gamma_low
+        + (gamma_high - gamma_low) * torch.rand((), device=reference.device),
+        "scale": scale_low
+        + (scale_high - scale_low) * torch.rand((), device=reference.device),
+        "shift": shift_low
+        + (shift_high - shift_low) * torch.rand((), device=reference.device),
+        "noise_std": noise_low
+        + (noise_high - noise_low) * torch.rand((), device=reference.device),
+    }
+
+
+def _apply_intensity_transform(
+    volume: torch.Tensor,
+    transform: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    if not transform:
+        return volume
+    gamma = transform["gamma"]
+    scale = transform["scale"]
+    shift = transform["shift"]
+    noise_std = transform["noise_std"]
     augmented = volume.clamp(0.0, 1.0).pow(gamma) * scale + shift
-    if noise_high > 0.0:
+    if float(noise_std) > 0.0:
         augmented = augmented + noise_std * torch.randn_like(augmented)
     return augmented.clamp(0.0, 1.0)
 
@@ -119,6 +145,17 @@ def _augment_pair(
     ):
         moving = torch.flip(moving, dims=(-1,))
         fixed = torch.flip(fixed, dims=(-1,))
+    intensity_pair_mode = str(
+        config.get("intensity_pair_mode", "independent")
+    ).strip().lower()
+    if intensity_pair_mode not in {"independent", "shared"}:
+        raise ValueError("augmentation.intensity_pair_mode must be independent or shared")
+    if intensity_pair_mode == "shared":
+        transform = _sample_intensity_transform(moving, config)
+        return (
+            _apply_intensity_transform(moving, transform),
+            _apply_intensity_transform(fixed, transform),
+        )
     return _augment_intensity(moving, config), _augment_intensity(fixed, config)
 
 
@@ -238,6 +275,11 @@ def _validate(
         warped_seg_np = warped_seg[0, 0].cpu().numpy()
         valid_labels = [index + 1 for index, flag in enumerate(sample["response_valid"][0].tolist()) if flag]
         spacing = tuple(float(value) for value in sample["spacing_dhw"][0].tolist())
+        spacing_tensor = flow.new_tensor(spacing).view(1, 3, 1, 1, 1)
+        displacement_mm = torch.linalg.vector_norm(
+            flow.float() * spacing_tensor,
+            dim=1,
+        )
         segmentation = evaluate_segmentation_pair(
             warped_seg_np,
             fixed_seg_np,
@@ -254,6 +296,10 @@ def _validate(
                 "mean_dice": float(segmentation["mean_dice"]),
                 "mean_hd95": float(segmentation["mean_hd95"]),
                 "mean_assd": float(segmentation["mean_assd"]),
+                "mean_displacement_mm": float(displacement_mm.mean().cpu()),
+                "p95_displacement_mm": float(
+                    torch.quantile(displacement_mm, 0.95).cpu()
+                ),
                 **jacobian,
                 **{
                     "dice_label_%d" % label: float(value)
@@ -520,12 +566,25 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 atomic_torch_save(state, output_dir / "best_validation_ncc.pt")
             if epoch % checkpoint_every == 0 or epoch == epochs:
                 atomic_torch_save(state, output_dir / ("epoch_%04d.pt" % epoch))
+            validation_dice = float(
+                validation_metrics.get("mean_dice", float("nan"))
+            )
+            validation_p95 = float(
+                validation_metrics.get("p95_displacement_mm", float("nan"))
+            )
             print(
-                "epoch %d complete lr=%.3e val_ncc=%s best=%.5f"
+                "epoch %d complete lr=%.3e val_ncc=%s val_dice=%s "
+                "val_p95_mm=%s best=%.5f"
                 % (
                     epoch,
                     lr,
                     "%.5f" % score if np.isfinite(score) else "not-run",
+                    "%.5f" % validation_dice
+                    if np.isfinite(validation_dice)
+                    else "not-run",
+                    "%.3f" % validation_p95
+                    if np.isfinite(validation_p95)
+                    else "not-run",
                     best_validation_ncc,
                 )
             )

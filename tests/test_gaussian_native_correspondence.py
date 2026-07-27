@@ -98,6 +98,83 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
                 )
             )
 
+    def test_v3_calibration_cancels_identity_value_and_gradient(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            position_weight=0.6,
+            sinkhorn_iterations=5,
+            parent_candidates=2,
+            identity_calibration=True,
+            calibration_gradient=True,
+            coordinate_mode="canonical",
+            mutual_transport=True,
+        )
+        results = matcher(fixed, fixed, extent)
+        identity_delta = sum(
+            result["transport_delta_mm"].sum()
+            for result in results
+        )
+        identity_delta.backward()
+        self.assertLess(float(identity_delta.detach().abs()), 1.0e-6)
+        for level_matcher in matcher.matchers:
+            gradient = level_matcher.feature_projection.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertLess(float(gradient.abs().max()), 1.0e-6)
+
+    def test_v3_transport_is_invariant_to_learned_center_drift(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        drift = torch.tensor([[[8.0, -4.0, 2.0]]])
+        moving = [
+            replace(level, centers_mm=level.centers_mm + drift)
+            for level in fixed
+        ]
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            position_weight=0.6,
+            sinkhorn_iterations=5,
+            parent_candidates=2,
+            identity_calibration=True,
+            calibration_gradient=True,
+            coordinate_mode="canonical",
+            mutual_transport=True,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            self.assertTrue(
+                torch.allclose(
+                    result["transport_delta_mm"],
+                    torch.zeros_like(result["transport_delta_mm"]),
+                    atol=1.0e-6,
+                )
+            )
+
+    def test_v3_feature_correspondence_moves_between_canonical_anchors(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        moving = list(fixed)
+        moving[0] = replace(
+            fixed[0],
+            features=torch.roll(fixed[0].features, shifts=1, dims=1),
+        )
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.02,
+            position_weight=0.0,
+            dustbin_mass=0.0,
+            sinkhorn_iterations=8,
+            parent_candidates=8,
+            identity_calibration=True,
+            calibration_gradient=True,
+            coordinate_mode="canonical",
+            mutual_transport=True,
+        )
+        results = matcher(fixed, moving, extent)
+        displacement = torch.linalg.vector_norm(
+            results[0]["transport_delta_mm"],
+            dim=-1,
+        )
+        self.assertGreater(float(displacement.detach().mean()), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

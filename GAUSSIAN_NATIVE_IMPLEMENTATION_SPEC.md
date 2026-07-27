@@ -144,10 +144,12 @@ the identity deformation.
 
 ### 4.2 Identity-calibrated residual motion hierarchy
 
-Revision v2 subtracts a fixed-to-fixed self-transport barycentre from the
-fixed-to-moving transport barycentre. This removes entropic matching bias,
-gives exactly zero direct displacement for identical inputs, and lets
-correspondence drive motion without a confidence or scale gate.
+Revision v3 assigns every learned anatomy Gaussian a volume-independent
+canonical anchor. Fixed-to-moving mutual transport is evaluated between these
+anchors and calibrated by a fully differentiable fixed-to-fixed
+self-transport. This removes entropic matching bias in both value and
+gradient, gives exactly zero direct displacement for identical inputs, and
+prevents learned Gaussian geometry from moving the deformation basis.
 
 The root level predicts coarse motion. Middle and fine levels use the
 calibrated transport displacement relative to their parent. Child residuals
@@ -160,6 +162,11 @@ v=v^{0}+\Delta v^{1}+\Delta v^{2}.
 
 This additive hierarchy avoids counting a global translation three times
 while preserving nonzero local motion at the middle and fine levels.
+
+The dense SVF is rasterized with canonical anchor centres, canonical scales,
+and uniform Gaussian mass. Learned centres, covariance, and mass remain part
+of anatomy representation and feature matching but cannot create a
+geometry-to-flow positive feedback loop.
 
 ### 4.3 Gaussian velocity synthesis
 

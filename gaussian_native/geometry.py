@@ -22,6 +22,8 @@ class GaussianLevel:
     features: torch.Tensor
     appearance: torch.Tensor
     parent_index: Optional[torch.Tensor]
+    anchor_centers_mm: Optional[torch.Tensor] = None
+    anchor_scales_mm: Optional[torch.Tensor] = None
     reconstruction: Optional[torch.Tensor] = None
     coverage: Optional[torch.Tensor] = None
 

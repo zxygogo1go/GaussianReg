@@ -211,8 +211,17 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         for value in data.get("spacing_dhw", (1.5, 1.5, 1.5))
     )
     architecture_revision = str(
-        model.get("architecture_revision", "gaussian_native_v2")
+        model.get("architecture_revision", "gaussian_native_v3")
     ).strip().lower()
+    v3 = architecture_revision == "gaussian_native_v3"
+    direct_limits = model.get(
+        "direct_displacement_limits_mm",
+        (12.0, 6.0, 3.0) if v3 else None,
+    )
+    learned_fractions = model.get(
+        "learned_translation_fractions",
+        (0.20, 0.12, 0.08) if v3 else None,
+    )
     return GaussianNativeRegistration(
         inshape=shape,
         spacing_dhw=spacing,
@@ -248,6 +257,26 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         ),
         direct_displacement_limit=float(
             model.get("direct_displacement_limit", 1.5)
+        ),
+        direct_displacement_limits_mm=(
+            None
+            if direct_limits is None
+            else tuple(float(value) for value in direct_limits)
+        ),
+        learned_translation_fractions=(
+            None
+            if learned_fractions is None
+            else tuple(float(value) for value in learned_fractions)
+        ),
+        max_rotation_radians=(
+            None
+            if model.get("max_rotation_radians") is None
+            else float(model["max_rotation_radians"])
+        ),
+        max_strain=(
+            None
+            if model.get("max_strain") is None
+            else float(model["max_strain"])
         ),
     )
 
@@ -379,6 +408,9 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
         diagnostics["matched_mass_l%d" % index] = float(
             result["matched_mass_fraction"].detach().float().mean().cpu()
         )
+        diagnostics["mutual_concentration_l%d" % index] = float(
+            result["mutual_concentration"].detach().float().cpu()
+        )
         if "transport_delta_mm" in result:
             diagnostics["transport_delta_l%d_mm" % index] = float(
                 torch.linalg.vector_norm(
@@ -402,6 +434,20 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
     for index, field in enumerate(output.get("level_velocity_mm", ())):
         diagnostics["level_velocity_l%d_abs_mm" % index] = float(
             field.detach().float().abs().mean().cpu()
+        )
+    fixed_levels = output.get("fixed_decomposition", {}).get("levels", ())
+    for index, level in enumerate(fixed_levels):
+        if level.anchor_centers_mm is None or level.anchor_scales_mm is None:
+            continue
+        normalized_offset = (
+            (level.centers_mm - level.anchor_centers_mm)
+            / level.anchor_scales_mm.clamp_min(1.0e-3)
+        )
+        diagnostics["anchor_offset_l%d" % index] = float(
+            torch.linalg.vector_norm(
+                normalized_offset.detach().float(),
+                dim=-1,
+            ).mean().cpu()
         )
     return diagnostics
 

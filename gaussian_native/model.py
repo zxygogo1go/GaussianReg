@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +30,7 @@ def _autocast_disabled(device: torch.device):
 class GaussianNativeRegistration(nn.Module):
     """Gaussian representation → correspondence → SVF → diffeomorphism."""
 
-    architecture_revision = "gaussian_native_v2"
+    architecture_revision = "gaussian_native_v3"
 
     def __init__(
         self,
@@ -58,18 +58,41 @@ class GaussianNativeRegistration(nn.Module):
         motion_mode: str = "affine",
         integration_mode: str = "svf",
         covariance_mode: str = "full",
-        architecture_revision: str = "gaussian_native_v2",
+        architecture_revision: str = "gaussian_native_v3",
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
         direct_displacement_limit: float = 1.5,
+        direct_displacement_limits_mm: Optional[Sequence[float]] = (12.0, 6.0, 3.0),
+        learned_translation_fractions: Optional[Sequence[float]] = (0.20, 0.12, 0.08),
+        max_rotation_radians: Optional[float] = None,
+        max_strain: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.architecture_revision = str(architecture_revision).strip().lower()
         if self.architecture_revision not in {
             "gaussian_native_v1",
             "gaussian_native_v2",
+            "gaussian_native_v3",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
-        use_v2_motion = self.architecture_revision == "gaussian_native_v2"
+        use_calibrated_motion = self.architecture_revision in {
+            "gaussian_native_v2",
+            "gaussian_native_v3",
+        }
+        use_v3_motion = self.architecture_revision == "gaussian_native_v3"
+        rotation_limit = (
+            0.08
+            if max_rotation_radians is None and use_v3_motion
+            else 0.20
+            if max_rotation_radians is None
+            else float(max_rotation_radians)
+        )
+        strain_limit = (
+            0.04
+            if max_strain is None and use_v3_motion
+            else 0.08
+            if max_strain is None
+            else float(max_strain)
+        )
         self.inshape = tuple(int(value) for value in inshape)
         self.pyramid_factors = tuple(int(value) for value in pyramid_factors)
         self.integration_mode = str(integration_mode).strip().lower()
@@ -106,20 +129,34 @@ class GaussianNativeRegistration(nn.Module):
             sinkhorn_iterations=sinkhorn_iterations,
             parent_candidates=parent_candidates,
             children_per_parent=children_per_parent,
-            identity_calibration=use_v2_motion,
+            identity_calibration=use_calibrated_motion,
+            calibration_gradient=use_v3_motion,
+            coordinate_mode="canonical" if use_v3_motion else "learned",
+            mutual_transport=use_v3_motion,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,
             hidden_dim=velocity_hidden_dim,
             children_per_parent=children_per_parent,
             motion_mode=motion_mode,
-            hierarchy_mode="soft_residual" if use_v2_motion else "hard_centered",
+            hierarchy_mode=(
+                "soft_residual" if use_calibrated_motion else "hard_centered"
+            ),
             direct_displacement_fractions=direct_displacement_fractions,
             direct_displacement_limit=direct_displacement_limit,
+            direct_displacement_limits_mm=(
+                direct_displacement_limits_mm if use_v3_motion else None
+            ),
+            learned_translation_fractions=(
+                learned_translation_fractions if use_v3_motion else None
+            ),
+            max_rotation_radians=rotation_limit,
+            max_strain=strain_limit,
         )
         self.velocity_synthesis = HierarchicalGaussianVelocitySynthesis(
             node_chunk=raster_chunk,
             cutoff_sigma=cutoff_sigma,
+            use_canonical_basis=use_v3_motion,
         )
         self.integration = ScalingAndSquaring(steps=integration_steps)
 
