@@ -78,18 +78,19 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
-The current production revision is v3. It uses a fixed canonical Gaussian
-anchor hierarchy for transport displacement and velocity synthesis, fully
-differentiable fixed-to-fixed calibration, and deterministic bidirectional
-mutual transport. Learned anatomy geometry still supplies representation and
-matching features, but cannot move the deformation basis. The v1/v2
-configurations remain available only for reproducing the earlier experiments.
+The current production revision is v4. It measures correspondence and motion
+in the learned anatomical Gaussian frame, subtracts a stopped fixed-to-fixed
+transport reference, and uses ordinary row-normalized Sinkhorn motion without
+mutual-plan sharpening. Canonical anchors are retained only as the stable
+velocity rasterization basis. Matching temperature is annealed from 0.20 to
+0.10 over the first 120 epochs. The v1/v2/v3 configurations remain available
+only for reproducing earlier experiments.
 
 First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_v3_hntsmrg24.json \
+  --config configs/gaussian_native_v4_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -98,11 +99,11 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v3_hntsmrg24.json \
+  --config configs/gaussian_native_v4_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v3_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v4_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
@@ -111,23 +112,28 @@ million trainable parameters. Training uses:
 
 - bidirectional multi-scale LNCC and normalized-gradient similarity;
 - Gaussian reconstruction, coverage, and hierarchy containment;
-- partial-transport cost, correspondence cycle, and hierarchy consistency;
+- Gaussian transport cost, correspondence cycle, and hierarchy consistency;
 - SVF smoothness, inverse consistency, and a Jacobian safety barrier;
-- pair-direction reversal, shared left-right flipping, and independent MRI
+- pair-direction reversal, shared left-right flipping, and shared MRI
   intensity augmentation.
+
+Each validation record includes NCC and Dice before/after registration,
+improvements, displacement, and topology. The console also reports coarse
+matching entropy, diagonal probability, and anatomical transport displacement;
+a joint high-confidence/zero-motion identity signature emits a warning.
 
 The best checkpoint is selected by validation NCC, not tumor Dice. Resume only
 with the same configuration and manifest hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v3_hntsmrg24.json \
+  --config configs/gaussian_native_v4_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v3_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v4_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v3_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v4_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -136,10 +142,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v3_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v4_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v3_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v4_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```

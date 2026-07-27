@@ -7,7 +7,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -213,14 +213,17 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
     architecture_revision = str(
         model.get("architecture_revision", "gaussian_native_v3")
     ).strip().lower()
-    v3 = architecture_revision == "gaussian_native_v3"
+    stable_motion_basis = architecture_revision in {
+        "gaussian_native_v3",
+        "gaussian_native_v4",
+    }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
-        (12.0, 6.0, 3.0) if v3 else None,
+        (12.0, 6.0, 3.0) if stable_motion_basis else None,
     )
     learned_fractions = model.get(
         "learned_translation_fractions",
-        (0.20, 0.12, 0.08) if v3 else None,
+        (0.20, 0.12, 0.08) if stable_motion_basis else None,
     )
     return GaussianNativeRegistration(
         inshape=shape,
@@ -411,6 +414,10 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
         diagnostics["mutual_concentration_l%d" % index] = float(
             result["mutual_concentration"].detach().float().cpu()
         )
+        if plan.shape[1] == plan.shape[2]:
+            diagnostics["diagonal_probability_l%d" % index] = float(
+                torch.diagonal(row, dim1=1, dim2=2).mean().cpu()
+            )
         if "transport_delta_mm" in result:
             diagnostics["transport_delta_l%d_mm" % index] = float(
                 torch.linalg.vector_norm(
@@ -462,6 +469,39 @@ def learning_rate_factor(epoch: int, epochs: int, warmup_epochs: int, minimum_fa
     return minimum_factor + 0.5 * (1.0 - minimum_factor) * (1.0 + math.cos(math.pi * progress))
 
 
+def correspondence_temperature_for_epoch(
+    config: Mapping[str, object],
+    epoch: int,
+) -> float:
+    """Cosine-anneal Gaussian matching temperature using one-indexed epochs."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    model = dict(config.get("model", {}))
+    start = float(model.get("match_temperature", 0.08))
+    end = float(model.get("match_temperature_end", start))
+    anneal_epochs = int(model.get("match_temperature_anneal_epochs", 1))
+    if start <= 0.0 or end <= 0.0 or anneal_epochs <= 0:
+        raise ValueError("matching temperatures and anneal epochs must be positive")
+    if anneal_epochs == 1:
+        return end
+    progress = min(max(float(epoch - 1) / float(anneal_epochs - 1), 0.0), 1.0)
+    return end + 0.5 * (start - end) * (1.0 + math.cos(math.pi * progress))
+
+
+def configure_model_for_epoch(
+    model: nn.Module,
+    config: Mapping[str, object],
+    epoch: int,
+) -> Optional[float]:
+    """Apply deterministic epoch-dependent model settings for train/eval/resume."""
+    setter = getattr(model, "set_correspondence_temperature", None)
+    if setter is None:
+        return None
+    temperature = correspondence_temperature_for_epoch(config, epoch)
+    setter(temperature)
+    return temperature
+
+
 def atomic_torch_save(value: object, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -508,7 +548,9 @@ __all__ = [
     "bootstrap_mean_ci",
     "build_model",
     "build_objective",
+    "configure_model_for_epoch",
     "config_architecture",
+    "correspondence_temperature_for_epoch",
     "cuda_autocast",
     "finite_mean",
     "learning_rate_factor",

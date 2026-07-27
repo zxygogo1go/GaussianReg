@@ -25,6 +25,7 @@ class PartialSinkhornMatcher(nn.Module):
         iterations: int = 12,
         coordinate_mode: str = "learned",
         mutual_transport: bool = False,
+        detach_geometry_cost: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= dustbin_mass < 0.5:
@@ -40,8 +41,15 @@ class PartialSinkhornMatcher(nn.Module):
         if self.coordinate_mode not in {"learned", "canonical"}:
             raise ValueError("coordinate_mode must be learned or canonical")
         self.mutual_transport = bool(mutual_transport)
+        self.detach_geometry_cost = bool(detach_geometry_cost)
         self.feature_projection = nn.Linear(feature_dim, feature_dim, bias=False)
         self.dustbin_score = nn.Parameter(torch.tensor(-1.0))
+
+    def set_temperature(self, temperature: float) -> None:
+        """Update the entropic matching temperature without changing weights."""
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        self.temperature = float(temperature)
 
     def _coordinates(self, level: GaussianLevel) -> torch.Tensor:
         if self.coordinate_mode == "learned":
@@ -99,13 +107,34 @@ class PartialSinkhornMatcher(nn.Module):
         feature_similarity = torch.einsum("bif,bjf->bij", fixed_feature, moving_feature)
         fixed_coordinate = self._coordinates(fixed)
         moving_coordinate = self._coordinates(moving)
+        fixed_cost_coordinate = (
+            fixed_coordinate.detach()
+            if self.detach_geometry_cost
+            else fixed_coordinate
+        )
+        moving_cost_coordinate = (
+            moving_coordinate.detach()
+            if self.detach_geometry_cost
+            else moving_coordinate
+        )
         center_delta = (
-            fixed_coordinate.unsqueeze(2) - moving_coordinate.unsqueeze(1)
+            fixed_cost_coordinate.unsqueeze(2)
+            - moving_cost_coordinate.unsqueeze(1)
         ) / extent_mm.unsqueeze(1).unsqueeze(1).clamp_min(1.0e-6)
         position_cost = center_delta.square().sum(dim=-1)
-        log_scale_delta = torch.log(fixed.scales_mm.clamp_min(1.0e-3)).unsqueeze(2) - torch.log(
-            moving.scales_mm.clamp_min(1.0e-3)
-        ).unsqueeze(1)
+        fixed_scale = (
+            fixed.scales_mm.detach()
+            if self.detach_geometry_cost
+            else fixed.scales_mm
+        )
+        moving_scale = (
+            moving.scales_mm.detach()
+            if self.detach_geometry_cost
+            else moving.scales_mm
+        )
+        log_scale_delta = torch.log(fixed_scale.clamp_min(1.0e-3)).unsqueeze(
+            2
+        ) - torch.log(moving_scale.clamp_min(1.0e-3)).unsqueeze(1)
         scale_cost = log_scale_delta.square().mean(dim=-1)
         cost = 1.0 - feature_similarity + self.position_weight * position_cost
         cost = cost + self.scale_weight * scale_cost
@@ -213,6 +242,7 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         calibration_gradient: bool = False,
         coordinate_mode: str = "learned",
         mutual_transport: bool = False,
+        detach_geometry_cost: bool = False,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
@@ -231,10 +261,22 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     iterations=sinkhorn_iterations,
                     coordinate_mode=coordinate_mode,
                     mutual_transport=mutual_transport,
+                    detach_geometry_cost=detach_geometry_cost,
                 )
                 for _ in range(3)
             ]
         )
+
+    @property
+    def temperature(self) -> float:
+        temperatures = {matcher.temperature for matcher in self.matchers}
+        if len(temperatures) != 1:
+            raise RuntimeError("correspondence levels have inconsistent temperatures")
+        return temperatures.pop()
+
+    def set_temperature(self, temperature: float) -> None:
+        for matcher in self.matchers:
+            matcher.set_temperature(temperature)
 
     def _candidate_mask(
         self,

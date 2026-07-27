@@ -9,12 +9,14 @@ from experiment_utils import (
     build_model,
     build_objective,
     config_architecture,
+    configure_model_for_epoch,
+    correspondence_temperature_for_epoch,
     learning_rate_factor,
     warp_volume,
 )
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from model import SACB_Net
-from train_registration import _augment_pair
+from train_registration import _augment_pair, _collapse_warning
 
 
 class ExperimentUtilityTests(unittest.TestCase):
@@ -87,6 +89,87 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertEqual(model.correspondence.coordinate_mode, "canonical")
         self.assertTrue(
             model.velocity_synthesis.rasterizer.use_canonical_basis
+        )
+
+    def test_v4_builder_uses_anatomical_matching_and_stable_raster_basis(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v4",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "match_temperature": 0.2,
+                "match_temperature_end": 0.1,
+                "match_temperature_anneal_epochs": 5,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v4")
+        self.assertFalse(model.correspondence.calibration_gradient)
+        self.assertEqual(model.correspondence.coordinate_mode, "learned")
+        self.assertFalse(model.correspondence.matchers[0].mutual_transport)
+        self.assertTrue(model.correspondence.matchers[0].detach_geometry_cost)
+        self.assertTrue(model.velocity_synthesis.rasterizer.use_canonical_basis)
+        self.assertAlmostEqual(configure_model_for_epoch(model, config, 1), 0.2)
+        self.assertAlmostEqual(model.correspondence.temperature, 0.2)
+        self.assertAlmostEqual(configure_model_for_epoch(model, config, 5), 0.1)
+        self.assertAlmostEqual(model.correspondence.temperature, 0.1)
+
+    def test_correspondence_temperature_schedule_boundaries(self):
+        config = {
+            "model": {
+                "match_temperature": 0.2,
+                "match_temperature_end": 0.1,
+                "match_temperature_anneal_epochs": 5,
+            }
+        }
+        self.assertAlmostEqual(
+            correspondence_temperature_for_epoch(config, 1),
+            0.2,
+        )
+        self.assertAlmostEqual(
+            correspondence_temperature_for_epoch(config, 3),
+            0.15,
+        )
+        self.assertAlmostEqual(
+            correspondence_temperature_for_epoch(config, 5),
+            0.1,
+        )
+        self.assertAlmostEqual(
+            correspondence_temperature_for_epoch(config, 50),
+            0.1,
+        )
+        with self.assertRaises(ValueError):
+            correspondence_temperature_for_epoch(config, 0)
+
+    def test_identity_collapse_warning_requires_joint_signature(self):
+        train = {
+            "match_entropy_l0": 0.01,
+            "diagonal_probability_l0": 0.99,
+            "transport_delta_l0_mm": 0.01,
+        }
+        validation = {"ncc_improvement": 0.01}
+        self.assertEqual(_collapse_warning(9, train, validation), "")
+        self.assertIn("identity", _collapse_warning(10, train, validation))
+        healthy_motion = dict(train)
+        healthy_motion["transport_delta_l0_mm"] = 2.0
+        self.assertEqual(
+            _collapse_warning(10, healthy_motion, validation),
+            "",
         )
 
     def test_pair_augmentation_preserves_shape_and_range(self):

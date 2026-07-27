@@ -17,6 +17,7 @@ from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256
 from experiment_utils import (
     bootstrap_mean_ci,
     build_model,
+    configure_model_for_epoch,
     config_architecture,
     cuda_autocast,
     load_json,
@@ -218,6 +219,31 @@ def main(expected_architecture: Optional[str] = None) -> None:
     state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
     state = {key.removeprefix("module."): value for key, value in state.items()}
     model.load_state_dict(state, strict=True)
+    checkpoint_epoch = (
+        int(checkpoint.get("epoch", 1))
+        if isinstance(checkpoint, dict)
+        else 1
+    )
+    configured_temperature = configure_model_for_epoch(
+        model,
+        config,
+        max(checkpoint_epoch, 1),
+    )
+    checkpoint_temperature = (
+        checkpoint.get("correspondence_temperature")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if checkpoint_temperature is not None:
+        setter = getattr(model, "set_correspondence_temperature", None)
+        if setter is not None:
+            setter(float(checkpoint_temperature))
+            configured_temperature = float(checkpoint_temperature)
+    if configured_temperature is not None:
+        print(
+            "correspondence_temperature=%.6f checkpoint_epoch=%d"
+            % (configured_temperature, checkpoint_epoch)
+        )
     model.to(device).eval()
     ncc = NCC_vxm(win=[int(dict(config.get("loss", {})).get("ncc_window", 9))] * 3).to(device)
     amp = bool(dict(config.get("optimization", {})).get("amp", True)) and device.type == "cuda"

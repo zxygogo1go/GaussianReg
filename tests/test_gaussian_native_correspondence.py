@@ -175,6 +175,48 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
         )
         self.assertGreater(float(displacement.detach().mean()), 1.0)
 
+    def test_v4_stopped_anatomical_calibration_preserves_translation(self):
+        fixed, extent = self._represent(torch.rand(1, 1, 32, 32, 32))
+        shift = torch.tensor([[[3.0, -2.0, 1.0]]])
+        moving = [
+            replace(level, centers_mm=level.centers_mm + shift)
+            for level in fixed
+        ]
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.2,
+            position_weight=0.0,
+            dustbin_mass=0.0,
+            sinkhorn_iterations=8,
+            parent_candidates=8,
+            identity_calibration=True,
+            calibration_gradient=False,
+            coordinate_mode="learned",
+            mutual_transport=False,
+            detach_geometry_cost=True,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            self.assertTrue(
+                torch.allclose(
+                    result["transport_delta_mm"],
+                    shift.expand_as(result["transport_delta_mm"]),
+                    atol=2.0e-4,
+                )
+            )
+
+    def test_temperature_setter_updates_all_levels(self):
+        self.matcher.set_temperature(0.17)
+        self.assertAlmostEqual(self.matcher.temperature, 0.17)
+        self.assertTrue(
+            all(
+                abs(level_matcher.temperature - 0.17) < 1.0e-12
+                for level_matcher in self.matcher.matchers
+            )
+        )
+        with self.assertRaises(ValueError):
+            self.matcher.set_temperature(0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,23 +72,30 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v1",
             "gaussian_native_v2",
             "gaussian_native_v3",
+            "gaussian_native_v4",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
             "gaussian_native_v2",
             "gaussian_native_v3",
+            "gaussian_native_v4",
+        }
+        use_stable_motion_basis = self.architecture_revision in {
+            "gaussian_native_v3",
+            "gaussian_native_v4",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
+        use_v4_motion = self.architecture_revision == "gaussian_native_v4"
         rotation_limit = (
             0.08
-            if max_rotation_radians is None and use_v3_motion
+            if max_rotation_radians is None and use_stable_motion_basis
             else 0.20
             if max_rotation_radians is None
             else float(max_rotation_radians)
         )
         strain_limit = (
             0.04
-            if max_strain is None and use_v3_motion
+            if max_strain is None and use_stable_motion_basis
             else 0.08
             if max_strain is None
             else float(max_strain)
@@ -131,8 +138,12 @@ class GaussianNativeRegistration(nn.Module):
             children_per_parent=children_per_parent,
             identity_calibration=use_calibrated_motion,
             calibration_gradient=use_v3_motion,
+            # V4 matches and measures motion in the learned anatomical Gaussian
+            # frame.  The stopped fixed-to-fixed reference removes entropic
+            # barycentre bias while preserving moving-to-fixed centre drift.
             coordinate_mode="canonical" if use_v3_motion else "learned",
             mutual_transport=use_v3_motion,
+            detach_geometry_cost=use_v4_motion,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,
@@ -145,10 +156,10 @@ class GaussianNativeRegistration(nn.Module):
             direct_displacement_fractions=direct_displacement_fractions,
             direct_displacement_limit=direct_displacement_limit,
             direct_displacement_limits_mm=(
-                direct_displacement_limits_mm if use_v3_motion else None
+                direct_displacement_limits_mm if use_stable_motion_basis else None
             ),
             learned_translation_fractions=(
-                learned_translation_fractions if use_v3_motion else None
+                learned_translation_fractions if use_stable_motion_basis else None
             ),
             max_rotation_radians=rotation_limit,
             max_strain=strain_limit,
@@ -156,9 +167,12 @@ class GaussianNativeRegistration(nn.Module):
         self.velocity_synthesis = HierarchicalGaussianVelocitySynthesis(
             node_chunk=raster_chunk,
             cutoff_sigma=cutoff_sigma,
-            use_canonical_basis=use_v3_motion,
+            use_canonical_basis=use_stable_motion_basis,
         )
         self.integration = ScalingAndSquaring(steps=integration_steps)
+
+    def set_correspondence_temperature(self, temperature: float) -> None:
+        self.correspondence.set_temperature(temperature)
 
     def forward(
         self,

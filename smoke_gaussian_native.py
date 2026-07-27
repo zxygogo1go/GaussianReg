@@ -13,6 +13,7 @@ from experiment_utils import (
     build_objective,
     cuda_autocast,
     load_json,
+    output_diagnostics,
     resolve_device,
     set_reproducibility,
 )
@@ -22,7 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v3_hntsmrg24.json",
+        default="configs/gaussian_native_v4_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -81,6 +82,20 @@ def main() -> None:
         "losses": {
             name: float(value.detach().float().cpu())
             for name, value in terms.items()
+        },
+        "diagnostics": {
+            name: value
+            for name, value in output_diagnostics(output).items()
+            if name == "velocity_vox_abs"
+            or name.startswith(
+                (
+                    "match_entropy_",
+                    "diagonal_probability_",
+                    "transport_delta_",
+                    "direct_translation_",
+                    "learned_translation_",
+                )
+            )
         },
     }
     print(json.dumps(result, indent=2, sort_keys=True))

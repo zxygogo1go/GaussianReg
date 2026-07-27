@@ -115,12 +115,12 @@ C_{ij}
 +\lambda_s\left\|\log\sigma_i^f-\log\sigma_j^m\right\|_2^2.
 \]
 
-Entropic Sinkhorn transport uses Gaussian masses as marginals and adds one
-dustbin row/column for unmatched anatomy. The transport yields matched moving
-features, centers, scales, and covariances for every fixed Gaussian.
-
-The dustbin is not a standalone confidence head and is never used to gate two
-deformation branches.
+Entropic Sinkhorn transport uses Gaussian masses as marginals. The
+implementation supports an unmatched dustbin for ablation, but production v4
+sets its mass to zero because row-normalized motion would otherwise erase its
+absolute unmatched mass. The transport yields matched moving features,
+centers, scales, and covariances for every fixed Gaussian. There is no
+standalone confidence head or deformation gate.
 
 ## 4. Module II: Gaussian Stationary Velocity Field Generator
 
@@ -139,17 +139,33 @@ v_i(x)=t_i+\left(\Omega(\omega_i)+S_i\right)(x-\mu_i).
 The motion head consumes the fixed feature, transported moving feature, center
 offset, log-scale ratio, and relative covariance.
 
-The final motion layer is zero-initialized, so an untrained model is exactly
-the identity deformation.
+The learned affine-residual layer is zero-initialized. Direct calibrated
+transport can still provide nonzero initial motion for different image pairs,
+while identical inputs have exactly zero calibrated transport displacement.
 
-### 4.2 Identity-calibrated residual motion hierarchy
+### 4.2 Anatomy-calibrated residual motion hierarchy
 
-Revision v3 assigns every learned anatomy Gaussian a volume-independent
-canonical anchor. Fixed-to-moving mutual transport is evaluated between these
-anchors and calibrated by a fully differentiable fixed-to-fixed
-self-transport. This removes entropic matching bias in both value and
-gradient, gives exactly zero direct displacement for identical inputs, and
-prevents learned Gaussian geometry from moving the deformation basis.
+Revision v4 computes ordinary row-normalized fixed-to-moving transport in the
+learned anatomical Gaussian frame. Its direct displacement is:
+
+\[
+\Delta_i =
+\sum_j q^{FM}_{ij}\mu^M_j -
+\operatorname{stopgrad}\left(\sum_j q^{FF}_{ij}\mu^F_j\right).
+\]
+
+The stopped fixed-to-fixed reference removes entropic barycentre bias and
+keeps identical-input direct displacement exactly zero. Unlike v3 canonical
+calibration, a same-index match still preserves the longitudinal difference
+between moving and fixed anatomical Gaussian centres. Mutual row/column plan
+multiplication is not used for motion because it over-sharpens early
+correspondence.
+
+Explicit centre/scale matching costs are detached from geometry prediction so
+that geometry cannot directly lower those costs by moving itself. Geometry
+can still affect correspondence through Gaussian graph features. A low
+position weight is only a soft anatomical locality prior, and the matching
+temperature is cosine-annealed from 0.20 to 0.10.
 
 The root level predicts coarse motion. Middle and fine levels use the
 calibrated transport displacement relative to their parent. Child residuals
@@ -164,9 +180,8 @@ This additive hierarchy avoids counting a global translation three times
 while preserving nonzero local motion at the middle and fine levels.
 
 The dense SVF is rasterized with canonical anchor centres, canonical scales,
-and uniform Gaussian mass. Learned centres, covariance, and mass remain part
-of anatomy representation and feature matching but cannot create a
-geometry-to-flow positive feedback loop.
+and uniform Gaussian mass. Learned centres determine transport motion but do
+not move the rasterization kernels themselves.
 
 ### 4.3 Gaussian velocity synthesis
 
@@ -238,6 +253,9 @@ used only for response-aware Dice, HD95, and ASSD.
 - Feature width: 128.
 - Graph encoder: three blocks per level, eight heads, 16 neighbours.
 - Partial Sinkhorn iterations: 12.
+- Matching temperature: cosine 0.20 to 0.10 over 120 epochs.
+- Position weight: 0.12.
+- Production dustbin mass: 0.
 - Local samples: `3×3×3` per primitive.
 - Integration steps: 7.
 - Trainable parameters: 2,082,046.

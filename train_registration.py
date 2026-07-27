@@ -18,6 +18,7 @@ from experiment_utils import (
     atomic_torch_save,
     build_model,
     build_objective,
+    configure_model_for_epoch,
     config_architecture,
     cuda_autocast,
     finite_mean,
@@ -271,6 +272,7 @@ def _validate(
             ncc_after = -objective.ncc(fixed, warped)
         moving_seg = sample["moving_seg"].to(device, non_blocking=True).float()
         warped_seg = warp_volume(moving_seg, flow.float(), mode="nearest").round().long()
+        moving_seg_np = sample["moving_seg"][0, 0].numpy()
         fixed_seg_np = sample["fixed_seg"][0, 0].numpy()
         warped_seg_np = warped_seg[0, 0].cpu().numpy()
         valid_labels = [index + 1 for index, flag in enumerate(sample["response_valid"][0].tolist()) if flag]
@@ -280,7 +282,15 @@ def _validate(
             flow.float() * spacing_tensor,
             dim=1,
         )
-        segmentation = evaluate_segmentation_pair(
+        segmentation_before = evaluate_segmentation_pair(
+            moving_seg_np,
+            fixed_seg_np,
+            labels=(1, 2),
+            spacing_dhw=spacing,
+            response_aware=True,
+            valid_labels=valid_labels,
+        )
+        segmentation_after = evaluate_segmentation_pair(
             warped_seg_np,
             fixed_seg_np,
             labels=(1, 2),
@@ -293,9 +303,17 @@ def _validate(
             {
                 "ncc_before": float(ncc_before.float().cpu()),
                 "ncc_after": float(ncc_after.float().cpu()),
-                "mean_dice": float(segmentation["mean_dice"]),
-                "mean_hd95": float(segmentation["mean_hd95"]),
-                "mean_assd": float(segmentation["mean_assd"]),
+                "ncc_improvement": float(
+                    (ncc_after - ncc_before).float().cpu()
+                ),
+                "dice_before": float(segmentation_before["mean_dice"]),
+                "mean_dice": float(segmentation_after["mean_dice"]),
+                "dice_improvement": float(
+                    segmentation_after["mean_dice"]
+                    - segmentation_before["mean_dice"]
+                ),
+                "mean_hd95": float(segmentation_after["mean_hd95"]),
+                "mean_assd": float(segmentation_after["mean_assd"]),
                 "mean_displacement_mm": float(displacement_mm.mean().cpu()),
                 "p95_displacement_mm": float(
                     torch.quantile(displacement_mm, 0.95).cpu()
@@ -303,12 +321,74 @@ def _validate(
                 **jacobian,
                 **{
                     "dice_label_%d" % label: float(value)
-                    for label, value in segmentation["dice_per_class"].items()
+                    for label, value in segmentation_after[
+                        "dice_per_class"
+                    ].items()
                 },
             }
         )
     names = sorted({name for record in case_records for name in record})
     return {name: finite_mean(record.get(name, float("nan")) for record in case_records) for name in names}
+
+
+def _collapse_warning(
+    epoch: int,
+    train_metrics: Mapping[str, float],
+    validation_metrics: Mapping[str, float],
+) -> str:
+    """Describe identity-collapse, near-identity, and topology warning states."""
+    entropy = float(train_metrics.get("match_entropy_l0", float("nan")))
+    diagonal = float(
+        train_metrics.get("diagonal_probability_l0", float("nan"))
+    )
+    displacement = float(
+        train_metrics.get("transport_delta_l0_mm", float("nan"))
+    )
+    ncc_gain = float(
+        validation_metrics.get("ncc_improvement", float("nan"))
+    )
+    p95 = float(
+        validation_metrics.get("p95_displacement_mm", float("nan"))
+    )
+    folding = float(
+        validation_metrics.get("negative_jacobian_ratio", float("nan"))
+    )
+    warnings = []
+    if (
+        epoch >= 10
+        and np.isfinite(entropy)
+        and np.isfinite(diagonal)
+        and np.isfinite(displacement)
+        and np.isfinite(ncc_gain)
+        and entropy < 0.03
+        and diagonal > 0.97
+        and displacement < 0.10
+        and ncc_gain < 0.02
+    ):
+        warnings.append(
+            (
+                "warning: coarse Gaussian correspondence is locked to the "
+                "same-index identity path (entropy=%.4f diagonal=%.4f "
+                "delta=%.4fmm val_ncc_gain=%.4f)"
+                % (entropy, diagonal, displacement, ncc_gain)
+            )
+        )
+    if (
+        epoch >= 20
+        and np.isfinite(ncc_gain)
+        and np.isfinite(p95)
+        and ncc_gain < 0.03
+        and p95 < 2.0
+    ):
+        warnings.append(
+            "warning: validation remains near identity "
+            "(val_ncc_gain=%.4f p95=%.3fmm)" % (ncc_gain, p95)
+        )
+    if np.isfinite(folding) and folding > 0.02:
+        warnings.append(
+            "warning: negative Jacobian ratio %.5f exceeds 0.02" % folding
+        )
+    return "\n".join(warnings)
 
 
 def _checkpoint(
@@ -324,7 +404,7 @@ def _checkpoint(
     validation_metrics: Mapping[str, float],
 ) -> Dict[str, object]:
     return {
-        "format_version": 2,
+        "format_version": 3,
         "architecture_revision": getattr(
             model,
             "architecture_revision",
@@ -338,6 +418,9 @@ def _checkpoint(
         "config": dict(config),
         "manifest_sha256": dict(manifests),
         "best_validation_ncc": float(best_validation_ncc),
+        "correspondence_temperature": train_metrics.get(
+            "correspondence_temperature"
+        ),
         "train_metrics": dict(train_metrics),
         "validation_metrics": dict(validation_metrics),
     }
@@ -506,6 +589,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
         raise ValueError("validation/checkpoint/log intervals and gradient_clip must be positive")
     try:
         for epoch in range(start_epoch, epochs + 1):
+            match_temperature = configure_model_for_epoch(
+                model,
+                config,
+                epoch,
+            )
             lr = float(optimizer.param_groups[0]["lr"])
             train_metrics = _train_epoch(
                 model,
@@ -521,6 +609,10 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 epoch,
                 log_every,
             )
+            if match_temperature is not None:
+                train_metrics["correspondence_temperature"] = float(
+                    match_temperature
+                )
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:
                 validation_metrics = _validate(
@@ -573,11 +665,16 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 validation_metrics.get("p95_displacement_mm", float("nan"))
             )
             print(
-                "epoch %d complete lr=%.3e val_ncc=%s val_dice=%s "
-                "val_p95_mm=%s best=%.5f"
+                "epoch %d complete lr=%.3e match_temp=%s val_ncc=%s "
+                "val_dice=%s val_p95_mm=%s h0=%.4f diag0=%.4f "
+                "delta0_mm=%.3f ncc_gain=%.5f dice_gain=%.5f "
+                "fold=%.6f best=%.5f"
                 % (
                     epoch,
                     lr,
+                    "%.4f" % match_temperature
+                    if match_temperature is not None
+                    else "n/a",
                     "%.5f" % score if np.isfinite(score) else "not-run",
                     "%.5f" % validation_dice
                     if np.isfinite(validation_dice)
@@ -585,9 +682,52 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     "%.3f" % validation_p95
                     if np.isfinite(validation_p95)
                     else "not-run",
+                    float(
+                        train_metrics.get(
+                            "match_entropy_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "diagonal_probability_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "transport_delta_l0_mm",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        validation_metrics.get(
+                            "ncc_improvement",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        validation_metrics.get(
+                            "dice_improvement",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        validation_metrics.get(
+                            "negative_jacobian_ratio",
+                            float("nan"),
+                        )
+                    ),
                     best_validation_ncc,
                 )
             )
+            warning = _collapse_warning(
+                epoch,
+                train_metrics,
+                validation_metrics,
+            )
+            if warning:
+                print(warning)
     finally:
         writer.close()
 
