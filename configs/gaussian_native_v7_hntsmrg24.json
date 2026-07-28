@@ -1,6 +1,6 @@
 {
   "schema_version": 7,
-  "experiment_name": "gaussian_native_v7_hntsmrg24",
+  "experiment_name": "gaussian_native_v7_ampfix_hntsmrg24",
   "seed": 2026,
   "data": {
     "cohort": "HNTS-MRG24 longitudinal T2",
@@ -95,6 +95,7 @@
     "gradient_clip": 3.0,
     "amp": true,
     "amp_dtype": "bfloat16",
+    "amp_cache_enabled": false,
     "allow_tf32": true,
     "validate_every": 1,
     "checkpoint_every": 10,

@@ -76,8 +76,18 @@ def resolve_device(requested: str) -> torch.device:
     return device
 
 
-def cuda_autocast(enabled: bool, dtype: str = "float16"):
-    """Version-compatible CUDA autocast context (PyTorch 1.13 through 2.x)."""
+def cuda_autocast(
+    enabled: bool,
+    dtype: str = "float16",
+    cache_enabled: bool = False,
+):
+    """Version-compatible CUDA autocast with explicit weight-cache policy.
+
+    The Gaussian matcher is called first for fixed-to-fixed calibration under
+    ``no_grad`` and then for fixed-to-moving registration with gradients. AMP's
+    weight cache can otherwise reuse the detached calibration cast and silently
+    disconnect the trainable matcher. The safe default is therefore disabled.
+    """
     normalized = str(dtype).strip().lower()
     if normalized not in {"float16", "bfloat16"}:
         raise ValueError("autocast dtype must be float16 or bfloat16")
@@ -87,8 +97,13 @@ def cuda_autocast(enabled: bool, dtype: str = "float16"):
             device_type="cuda",
             enabled=bool(enabled),
             dtype=torch_dtype,
+            cache_enabled=bool(cache_enabled),
         )
-    return torch.cuda.amp.autocast(enabled=bool(enabled), dtype=torch_dtype)
+    return torch.cuda.amp.autocast(
+        enabled=bool(enabled),
+        dtype=torch_dtype,
+        cache_enabled=bool(cache_enabled),
+    )
 
 
 def make_grad_scaler(

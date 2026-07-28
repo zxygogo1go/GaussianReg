@@ -169,6 +169,7 @@ def _train_epoch(
     device: torch.device,
     amp: bool,
     amp_dtype: str,
+    amp_cache_enabled: bool,
     augmentation: Mapping[str, object],
     gradient_clip: float,
     epoch: int,
@@ -178,19 +179,63 @@ def _train_epoch(
     totals = defaultdict(float)
     sample_count = 0
     successful_steps = 0
+    first_step_pair_gradient_l1 = None
     start = time.perf_counter()
     for step, sample in enumerate(loader, start=1):
         moving = sample["moving"].to(device, non_blocking=True)
         fixed = sample["fixed"].to(device, non_blocking=True)
         moving, fixed = _augment_pair(moving, fixed, augmentation)
         optimizer.zero_grad(set_to_none=True)
-        with cuda_autocast(amp, amp_dtype):
+        with cuda_autocast(
+            amp,
+            amp_dtype,
+            cache_enabled=amp_cache_enabled,
+        ):
             output = model(moving, fixed, return_aux=True)
             terms = objective(output, moving, fixed)
         if not bool(torch.isfinite(terms["total"]).detach()):
             raise FloatingPointError("non-finite loss for patients %s" % list(sample["patient_id"]))
         scaler.scale(terms["total"]).backward()
         scaler.unscale_(optimizer)
+        if step == 1:
+            pair_gradients = []
+            correspondence = getattr(model, "correspondence", None)
+            for level_index, matcher in enumerate(
+                getattr(correspondence, "matchers", ())
+            ):
+                scorer = getattr(matcher, "pair_residual_score", None)
+                if scorer is None:
+                    continue
+                gradient = scorer[-1].weight.grad
+                if gradient is None:
+                    raise RuntimeError(
+                        "level %d pair residual scorer has no gradient; "
+                        "disable the AMP weight cache"
+                        % level_index
+                    )
+                if not bool(torch.isfinite(gradient).all()):
+                    raise FloatingPointError(
+                        "level %d pair residual scorer gradient is non-finite"
+                        % level_index
+                    )
+                gradient_l1 = float(
+                    gradient.detach().float().abs().sum().cpu()
+                )
+                if gradient_l1 <= 0.0:
+                    raise RuntimeError(
+                        "level %d pair residual scorer gradient is zero"
+                        % level_index
+                    )
+                pair_gradients.append(gradient_l1)
+            if pair_gradients:
+                first_step_pair_gradient_l1 = float(sum(pair_gradients))
+                print(
+                    "epoch %d pair_residual_grad_l1=%s"
+                    % (
+                        epoch,
+                        "/".join("%.6g" % value for value in pair_gradients),
+                    )
+                )
         gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(gradient_clip))
         if not bool(torch.isfinite(torch.as_tensor(gradient_norm)).detach()):
             if not amp or amp_dtype != "float16":
@@ -246,6 +291,10 @@ def _train_epoch(
     if successful_steps == 0:
         raise FloatingPointError("all optimizer steps in the epoch were skipped")
     result = {name: value / max(sample_count, 1) for name, value in totals.items()}
+    if first_step_pair_gradient_l1 is not None:
+        result["pair_residual_gradient_l1_first_step"] = (
+            first_step_pair_gradient_l1
+        )
     result["seconds"] = time.perf_counter() - start
     return result
 
@@ -258,6 +307,7 @@ def _validate(
     device: torch.device,
     amp: bool,
     amp_dtype: str,
+    amp_cache_enabled: bool,
 ) -> Dict[str, float]:
     model.eval()
     case_records = []
@@ -266,7 +316,11 @@ def _validate(
             raise AssertionError("validation requires batch size one for per-patient metrics")
         moving = sample["moving"].to(device, non_blocking=True)
         fixed = sample["fixed"].to(device, non_blocking=True)
-        with cuda_autocast(amp, amp_dtype):
+        with cuda_autocast(
+            amp,
+            amp_dtype,
+            cache_enabled=amp_cache_enabled,
+        ):
             warped, flow = model(moving, fixed, return_aux=False)
             ncc_before = -objective.ncc(fixed, moving)
             ncc_after = -objective.ncc(fixed, warped)
@@ -664,8 +718,29 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     )
     amp = bool(optimization.get("amp", True)) and device.type == "cuda"
     amp_dtype = str(optimization.get("amp_dtype", "bfloat16")).strip().lower()
+    amp_cache_enabled = bool(
+        optimization.get("amp_cache_enabled", False)
+    )
     if amp_dtype not in {"float16", "bfloat16"}:
         raise ValueError("optimization.amp_dtype must be float16 or bfloat16")
+    if (
+        amp
+        and amp_cache_enabled
+        and getattr(
+            getattr(model, "correspondence", None),
+            "identity_calibration",
+            False,
+        )
+        and not getattr(
+            getattr(model, "correspondence", None),
+            "calibration_gradient",
+            True,
+        )
+    ):
+        raise ValueError(
+            "AMP weight caching is unsafe when no-grad identity "
+            "calibration reuses the trainable matcher"
+        )
     scaler = make_grad_scaler(
         amp and amp_dtype == "float16",
         initial_scale=float(optimization.get("amp_initial_scale", 1024.0)),
@@ -674,6 +749,10 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(optimization.get("allow_tf32", True))
         torch.backends.cudnn.allow_tf32 = bool(optimization.get("allow_tf32", True))
+    print(
+        "amp=%s amp_dtype=%s amp_cache_enabled=%s"
+        % (amp, amp_dtype, amp_cache_enabled)
+    )
 
     manifests = {
         "train": manifest_sha256(args.train_manifest),
@@ -758,6 +837,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 device,
                 amp,
                 amp_dtype,
+                amp_cache_enabled,
                 augmentation,
                 gradient_clip,
                 epoch,
@@ -784,6 +864,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     device,
                     amp,
                     amp_dtype,
+                    amp_cache_enabled,
                 )
                 validation_history.append(
                     {

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from experiment_utils import build_model, build_objective
+from experiment_utils import build_model, build_objective, cuda_autocast
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from gaussian_native.integration import ScalingAndSquaring, compose_displacements
 from gaussian_native.velocity import GaussianVelocityHead
@@ -376,6 +376,64 @@ class GaussianNativeModelTests(unittest.TestCase):
             sum(float(gradient.abs().sum()) for gradient in encoder_gradients),
             0.0,
         )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "CUDA is required for the autocast cache regression",
+    )
+    def test_v7_bfloat16_updates_pair_residual_scorer(self):
+        config = small_config()
+        config["model"].update(
+            {
+                "architecture_revision": "gaussian_native_v7",
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "appearance_residual",
+                "appearance_weight": 1.0,
+                "feature_residual_weight": 0.2,
+                "max_feature_residual_logit": 2.0,
+                "pair_score_hidden_dim": 16,
+                "dustbin_mass": 0.0,
+                "motion_mode": "translation",
+                "include_identity_candidate": False,
+                "direct_displacement_limits_mm": [8.0, 3.0, 1.5],
+            }
+        )
+        config["loss"].update(
+            {
+                "similarity": 1.0,
+                "representation": 0.0,
+                "correspondence": 0.0,
+                "deformation": 0.0,
+                "ngf_weight": 0.0,
+            }
+        )
+        device = torch.device("cuda:0")
+        model = build_model(config).to(device).train()
+        objective = build_objective(config).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
+        moving = torch.rand(1, 1, 32, 32, 32, device=device)
+        fixed = torch.rand_like(moving)
+        before = [
+            matcher.pair_residual_score[-1].weight.detach().clone()
+            for matcher in model.correspondence.matchers
+        ]
+        with cuda_autocast(True, "bfloat16"):
+            output = model(moving, fixed, return_aux=True)
+            terms = objective(output, moving, fixed)
+        terms["total"].backward()
+        for matcher in model.correspondence.matchers:
+            gradient = matcher.pair_residual_score[-1].weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(float(gradient.abs().sum()), 0.0)
+        optimizer.step()
+        for previous, matcher in zip(
+            before,
+            model.correspondence.matchers,
+        ):
+            current = matcher.pair_residual_score[-1].weight.detach()
+            self.assertGreater(float((current - previous).abs().sum()), 0.0)
 
     def test_principal_ablation_switches_construct_and_run(self):
         config = small_config()

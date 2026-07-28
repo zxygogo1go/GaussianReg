@@ -42,6 +42,9 @@ def main() -> None:
     optimization = dict(config.get("optimization", {}))
     amp = bool(optimization.get("amp", True)) and device.type == "cuda"
     amp_dtype = str(optimization.get("amp_dtype", "bfloat16")).strip().lower()
+    amp_cache_enabled = bool(
+        optimization.get("amp_cache_enabled", False)
+    )
     model = build_model(config).to(device).train()
     objective = build_objective(config).to(device)
     generator = torch.Generator(device=device)
@@ -52,7 +55,11 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
     start = time.perf_counter()
-    with cuda_autocast(amp, amp_dtype):
+    with cuda_autocast(
+        amp,
+        amp_dtype,
+        cache_enabled=amp_cache_enabled,
+    ):
         output = model(moving, fixed, return_aux=True)
         terms = objective(output, moving, fixed)
     terms["total"].backward()
@@ -67,12 +74,37 @@ def main() -> None:
     finite = bool(torch.isfinite(terms["total"]).all()) and all(
         bool(torch.isfinite(gradient).all()) for gradient in gradients
     )
+    pair_residual_gradient_l1 = []
+    for matcher in getattr(
+        getattr(model, "correspondence", None),
+        "matchers",
+        (),
+    ):
+        scorer = getattr(matcher, "pair_residual_score", None)
+        if scorer is None:
+            continue
+        gradient = scorer[-1].weight.grad
+        pair_residual_gradient_l1.append(
+            None
+            if gradient is None
+            else float(gradient.detach().float().abs().sum().cpu())
+        )
+    pair_residual_trainable = (
+        not pair_residual_gradient_l1
+        or all(
+            value is not None and value > 0.0
+            for value in pair_residual_gradient_l1
+        )
+    )
     result = {
         "device": str(device),
         "shape_dhw": list(shape),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "gradient_tensors": len(gradients),
         "finite": finite,
+        "amp_cache_enabled": amp_cache_enabled,
+        "pair_residual_gradient_l1": pair_residual_gradient_l1,
+        "pair_residual_trainable": pair_residual_trainable,
         "seconds": seconds,
         "peak_gpu_memory_mb": (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 2))
@@ -107,6 +139,10 @@ def main() -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
     if not finite:
         raise FloatingPointError("production smoke test produced non-finite values")
+    if not pair_residual_trainable:
+        raise RuntimeError(
+            "pair residual scorer is disconnected from the training objective"
+        )
 
 
 if __name__ == "__main__":

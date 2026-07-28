@@ -301,10 +301,14 @@ def main(expected_architecture: Optional[str] = None) -> None:
         )
     model.to(device).eval()
     ncc = NCC_vxm(win=[int(dict(config.get("loss", {})).get("ncc_window", 9))] * 3).to(device)
-    amp = bool(dict(config.get("optimization", {})).get("amp", True)) and device.type == "cuda"
+    optimization = dict(config.get("optimization", {}))
+    amp = bool(optimization.get("amp", True)) and device.type == "cuda"
     amp_dtype = str(
-        dict(config.get("optimization", {})).get("amp_dtype", "bfloat16")
+        optimization.get("amp_dtype", "bfloat16")
     ).strip().lower()
+    amp_cache_enabled = bool(
+        optimization.get("amp_cache_enabled", False)
+    )
     if amp_dtype not in {"float16", "bfloat16"}:
         raise ValueError("optimization.amp_dtype must be float16 or bfloat16")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -321,7 +325,11 @@ def main(expected_architecture: Optional[str] = None) -> None:
             torch.cuda.reset_peak_memory_stats(device)
             torch.cuda.synchronize(device)
         start = time.perf_counter()
-        with cuda_autocast(amp, amp_dtype):
+        with cuda_autocast(
+            amp,
+            amp_dtype,
+            cache_enabled=amp_cache_enabled,
+        ):
             warped, flow = model(moving, fixed, return_aux=False)
         if device.type == "cuda":
             torch.cuda.synchronize(device)

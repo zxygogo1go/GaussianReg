@@ -53,7 +53,10 @@ pip install -r requirements.txt
 The code remains compatible with the original PyTorch 1.13/CUDA 11.7
 environment. The production configuration uses bfloat16 autocast on an A100;
 covariance, transport, rasterization, and integration calculations are kept in
-float32.
+float32. AMP weight caching is explicitly disabled because the same Gaussian
+matcher is first reused by no-gradient self-calibration and then by the
+gradient-bearing cross-image path; caching the first cast would disconnect the
+learned residual scorer.
 
 ## HNTS-MRG24 preprocessing
 
@@ -114,7 +117,7 @@ CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v7_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v7_ampfix_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
@@ -149,9 +152,9 @@ CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v7_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v7_ampfix_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v7_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v7_ampfix_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -160,10 +163,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v7_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v7_ampfix_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v7_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v7_ampfix_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```

@@ -311,6 +311,8 @@ used only for response-aware Dice, HD95, and ASSD.
 - Integration steps: 7.
 - Trainable parameters: 1,906,522.
 - Training autocast: bfloat16.
+- AMP weight cache: disabled to preserve gradients across no-gradient
+  fixed-to-fixed calibration and trainable fixed-to-moving matching.
 - Geometry, transport, rasterization, integration, and NCC: float32.
 
 ## 7. Required comparisons and ablations
