@@ -58,9 +58,14 @@ class GaussianNativeRegistration(nn.Module):
         motion_mode: str = "affine",
         integration_mode: str = "svf",
         covariance_mode: str = "full",
+        geometry_mode: str = "adaptive",
         architecture_revision: str = "gaussian_native_v3",
         appearance_weight: float = 0.0,
         transport_mode: str = "sinkhorn",
+        correspondence_score_mode: str = "convex",
+        feature_residual_weight: float = 0.0,
+        max_feature_residual_logit: float = 2.0,
+        pair_score_hidden_dim: int = 32,
         include_identity_candidate: Optional[bool] = None,
         match_evidence_power: float = 1.0,
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
@@ -79,6 +84,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v4",
             "gaussian_native_v5",
             "gaussian_native_v6",
+            "gaussian_native_v7",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -87,24 +93,29 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v4",
             "gaussian_native_v5",
             "gaussian_native_v6",
+            "gaussian_native_v7",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
             "gaussian_native_v4",
             "gaussian_native_v5",
             "gaussian_native_v6",
+            "gaussian_native_v7",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
             "gaussian_native_v4",
             "gaussian_native_v5",
             "gaussian_native_v6",
+            "gaussian_native_v7",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
             "gaussian_native_v6",
+            "gaussian_native_v7",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
+        use_v7_motion = self.architecture_revision == "gaussian_native_v7"
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
         rotation_limit = (
@@ -141,6 +152,7 @@ class GaussianNativeRegistration(nn.Module):
             samples_per_axis=samples_per_axis,
             raster_chunk=raster_chunk,
             covariance_mode=covariance_mode,
+            geometry_mode=geometry_mode if use_v7_motion else "adaptive",
         )
         self.encoder = HierarchicalGaussianEncoder(
             feature_dim=feature_dim,
@@ -162,7 +174,11 @@ class GaussianNativeRegistration(nn.Module):
             # V4 matches and measures motion in the learned anatomical Gaussian
             # frame.  The stopped fixed-to-fixed reference removes entropic
             # barycentre bias while preserving moving-to-fixed centre drift.
-            coordinate_mode="canonical" if use_v3_motion else "learned",
+            coordinate_mode=(
+                "canonical"
+                if use_v3_motion or use_v7_motion
+                else "learned"
+            ),
             mutual_transport=use_v3_motion,
             detach_geometry_cost=use_anatomical_motion,
             appearance_weight=(
@@ -177,6 +193,16 @@ class GaussianNativeRegistration(nn.Module):
                 if use_sparse_appearance_motion
                 else False
             ),
+            score_mode=(
+                correspondence_score_mode
+                if use_v7_motion
+                else "convex"
+            ),
+            feature_residual_weight=(
+                feature_residual_weight if use_v7_motion else 0.0
+            ),
+            max_feature_residual_logit=max_feature_residual_logit,
+            pair_score_hidden_dim=pair_score_hidden_dim,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,
@@ -214,6 +240,14 @@ class GaussianNativeRegistration(nn.Module):
         appearance_weight: float,
     ) -> None:
         self.correspondence.set_appearance_weight(appearance_weight)
+
+    def set_correspondence_feature_residual_weight(
+        self,
+        feature_residual_weight: float,
+    ) -> None:
+        self.correspondence.set_feature_residual_weight(
+            feature_residual_weight
+        )
 
     def forward(
         self,

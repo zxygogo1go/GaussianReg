@@ -28,6 +28,10 @@ class PartialSinkhornMatcher(nn.Module):
         detach_geometry_cost: bool = False,
         appearance_weight: float = 0.0,
         transport_mode: str = "sinkhorn",
+        score_mode: str = "convex",
+        feature_residual_weight: float = 0.0,
+        max_feature_residual_logit: float = 2.0,
+        pair_score_hidden_dim: int = 32,
     ) -> None:
         super().__init__()
         if not 0.0 <= dustbin_mass < 0.5:
@@ -52,7 +56,35 @@ class PartialSinkhornMatcher(nn.Module):
             raise ValueError("transport_mode must be sinkhorn or row_softmax")
         if self.transport_mode == "row_softmax" and self.dustbin_mass:
             raise ValueError("row_softmax requires dustbin_mass=0")
+        self.score_mode = str(score_mode).strip().lower()
+        if self.score_mode not in {"convex", "appearance_residual"}:
+            raise ValueError(
+                "score_mode must be convex or appearance_residual"
+            )
+        self.feature_residual_weight = float(feature_residual_weight)
+        if self.feature_residual_weight < 0.0:
+            raise ValueError("feature_residual_weight must be nonnegative")
+        self.max_feature_residual_logit = float(
+            max_feature_residual_logit
+        )
+        if self.max_feature_residual_logit <= 0.0:
+            raise ValueError(
+                "max_feature_residual_logit must be positive"
+            )
         self.feature_projection = nn.Linear(feature_dim, feature_dim, bias=False)
+        if self.score_mode == "appearance_residual":
+            if int(pair_score_hidden_dim) <= 0:
+                raise ValueError("pair_score_hidden_dim must be positive")
+            self.pair_residual_score = nn.Sequential(
+                nn.Linear(8, int(pair_score_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(pair_score_hidden_dim), 1),
+            )
+            final = self.pair_residual_score[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+        else:
+            self.pair_residual_score = None
         self.dustbin_score = nn.Parameter(torch.tensor(-1.0))
 
     def set_temperature(self, temperature: float) -> None:
@@ -67,6 +99,15 @@ class PartialSinkhornMatcher(nn.Module):
         if not 0.0 <= appearance_weight <= 1.0:
             raise ValueError("appearance_weight must lie in [0, 1]")
         self.appearance_weight = appearance_weight
+
+    def set_feature_residual_weight(
+        self,
+        feature_residual_weight: float,
+    ) -> None:
+        feature_residual_weight = float(feature_residual_weight)
+        if feature_residual_weight < 0.0:
+            raise ValueError("feature_residual_weight must be nonnegative")
+        self.feature_residual_weight = feature_residual_weight
 
     def _coordinates(self, level: GaussianLevel) -> torch.Tensor:
         if self.coordinate_mode == "learned":
@@ -158,7 +199,10 @@ class PartialSinkhornMatcher(nn.Module):
         fixed_feature = F.normalize(self.feature_projection(fixed.features), dim=-1)
         moving_feature = F.normalize(self.feature_projection(moving.features), dim=-1)
         feature_similarity = torch.einsum("bif,bjf->bij", fixed_feature, moving_feature)
-        if self.appearance_weight:
+        if (
+            self.appearance_weight
+            or self.score_mode == "appearance_residual"
+        ):
             fixed_appearance = self._standardized_appearance(fixed)
             moving_appearance = self._standardized_appearance(moving)
             if fixed_appearance.shape[-1] != moving_appearance.shape[-1]:
@@ -203,13 +247,49 @@ class PartialSinkhornMatcher(nn.Module):
         scale_cost = log_scale_delta.square().mean(dim=-1)
         feature_cost = 1.0 - feature_similarity
         appearance_cost = 1.0 - appearance_similarity
-        cost = (
-            (1.0 - self.appearance_weight) * feature_cost
-            + self.appearance_weight * appearance_cost
-            + self.position_weight * position_cost
-        )
-        cost = cost + self.scale_weight * scale_cost
-        logits = -cost / self.temperature
+        feature_residual_score = torch.zeros_like(feature_similarity)
+        if self.score_mode == "appearance_residual":
+            if self.pair_residual_score is None:
+                raise AssertionError("pair residual scorer is missing")
+            appearance_delta = (
+                fixed_appearance[..., 0].unsqueeze(2)
+                - moving_appearance[..., 0].unsqueeze(1)
+            ).abs()
+            pair_metrics = torch.cat(
+                (
+                    appearance_similarity.unsqueeze(-1),
+                    feature_similarity.unsqueeze(-1),
+                    center_delta,
+                    position_cost.sqrt().unsqueeze(-1),
+                    scale_cost.unsqueeze(-1),
+                    appearance_delta.unsqueeze(-1),
+                ),
+                dim=-1,
+            )
+            feature_residual_score = (
+                self.max_feature_residual_logit
+                * torch.tanh(
+                    self.pair_residual_score(pair_metrics).squeeze(-1)
+                )
+            )
+            base_cost = (
+                self.appearance_weight * appearance_cost
+                + self.position_weight * position_cost
+                + self.scale_weight * scale_cost
+            )
+            residual_logit = (
+                self.feature_residual_weight * feature_residual_score
+            )
+            logits = -base_cost / self.temperature + residual_logit
+            cost = base_cost - self.temperature * residual_logit
+        else:
+            cost = (
+                (1.0 - self.appearance_weight) * feature_cost
+                + self.appearance_weight * appearance_cost
+                + self.position_weight * position_cost
+            )
+            cost = cost + self.scale_weight * scale_cost
+            logits = -cost / self.temperature
         if candidate_mask is not None:
             if candidate_mask.shape != logits.shape:
                 raise AssertionError("candidate mask shape must match correspondence logits")
@@ -310,6 +390,10 @@ class PartialSinkhornMatcher(nn.Module):
             "cycle_error": cycle_error.mean(),
             "transport_cost": transport_cost,
             "mutual_concentration": selected_row_plan.max(dim=2).values.mean(),
+            "feature_residual_score": feature_residual_score,
+            "feature_residual_logit": (
+                self.feature_residual_weight * feature_residual_score
+            ),
             "support_entropy": support_entropy,
             "match_evidence": match_evidence,
             "support_size": support_size,
@@ -340,6 +424,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         transport_mode: str = "sinkhorn",
         shared_calibration_candidates: bool = False,
         include_identity_candidate: bool = False,
+        score_mode: str = "convex",
+        feature_residual_weight: float = 0.0,
+        max_feature_residual_logit: float = 2.0,
+        pair_score_hidden_dim: int = 32,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
@@ -365,6 +453,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     detach_geometry_cost=detach_geometry_cost,
                     appearance_weight=appearance_weight,
                     transport_mode=transport_mode,
+                    score_mode=score_mode,
+                    feature_residual_weight=feature_residual_weight,
+                    max_feature_residual_logit=max_feature_residual_logit,
+                    pair_score_hidden_dim=pair_score_hidden_dim,
                 )
                 for _ in range(3)
             ]
@@ -393,6 +485,27 @@ class HierarchicalGaussianCorrespondence(nn.Module):
     def set_appearance_weight(self, appearance_weight: float) -> None:
         for matcher in self.matchers:
             matcher.set_appearance_weight(appearance_weight)
+
+    @property
+    def feature_residual_weight(self) -> float:
+        weights = {
+            matcher.feature_residual_weight
+            for matcher in self.matchers
+        }
+        if len(weights) != 1:
+            raise RuntimeError(
+                "correspondence levels have inconsistent residual weights"
+            )
+        return weights.pop()
+
+    def set_feature_residual_weight(
+        self,
+        feature_residual_weight: float,
+    ) -> None:
+        for matcher in self.matchers:
+            matcher.set_feature_residual_weight(
+                feature_residual_weight
+            )
 
     def _candidate_mask(
         self,

@@ -23,7 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v6_hntsmrg24.json",
+        default="configs/gaussian_native_v7_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -93,6 +93,7 @@ def main() -> None:
                     "support_entropy_",
                     "match_evidence_",
                     "motion_evidence_",
+                    "feature_residual_logit_",
                     "row_max_probability_",
                     "support_size_",
                     "diagonal_probability_",

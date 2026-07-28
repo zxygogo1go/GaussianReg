@@ -218,6 +218,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v4",
         "gaussian_native_v5",
         "gaussian_native_v6",
+        "gaussian_native_v7",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -252,9 +253,22 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         motion_mode=str(model.get("motion_mode", "affine")),
         integration_mode=str(model.get("integration_mode", "svf")),
         covariance_mode=str(model.get("covariance_mode", "full")),
+        geometry_mode=str(model.get("geometry_mode", "adaptive")),
         architecture_revision=architecture_revision,
         appearance_weight=float(model.get("appearance_weight", 0.0)),
         transport_mode=str(model.get("transport_mode", "sinkhorn")),
+        correspondence_score_mode=str(
+            model.get("correspondence_score_mode", "convex")
+        ),
+        feature_residual_weight=float(
+            model.get("feature_residual_weight", 0.0)
+        ),
+        max_feature_residual_logit=float(
+            model.get("max_feature_residual_logit", 2.0)
+        ),
+        pair_score_hidden_dim=int(
+            model.get("pair_score_hidden_dim", 32)
+        ),
         include_identity_candidate=(
             None
             if "include_identity_candidate" not in model
@@ -441,6 +455,15 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
             diagnostics["support_size_l%d" % index] = float(
                 result["support_size"].detach().float().mean().cpu()
             )
+        if "feature_residual_logit" in result:
+            diagnostics["feature_residual_logit_l%d" % index] = float(
+                result["feature_residual_logit"]
+                .detach()
+                .float()
+                .abs()
+                .mean()
+                .cpu()
+            )
         if plan.shape[1] == plan.shape[2]:
             diagnostics["diagonal_probability_l%d" % index] = float(
                 torch.diagonal(row, dim1=1, dim2=2).mean().cpu()
@@ -548,6 +571,32 @@ def appearance_weight_for_epoch(
     )
 
 
+def feature_residual_weight_for_epoch(
+    config: Mapping[str, object],
+    epoch: int,
+) -> float:
+    """Cosine-ramp the learned correction to fixed Gaussian matching."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    model = dict(config.get("model", {}))
+    start = float(model.get("feature_residual_weight", 0.0))
+    end = float(model.get("feature_residual_weight_end", start))
+    ramp_epochs = int(model.get("feature_residual_weight_anneal_epochs", 1))
+    if start < 0.0 or end < 0.0 or ramp_epochs <= 0:
+        raise ValueError(
+            "feature residual weights must be nonnegative and ramp epochs positive"
+        )
+    if ramp_epochs == 1:
+        return end
+    progress = min(
+        max(float(epoch - 1) / float(ramp_epochs - 1), 0.0),
+        1.0,
+    )
+    return end + 0.5 * (start - end) * (
+        1.0 + math.cos(math.pi * progress)
+    )
+
+
 def configure_model_for_epoch(
     model: nn.Module,
     config: Mapping[str, object],
@@ -566,6 +615,13 @@ def configure_model_for_epoch(
     )
     if appearance_setter is not None:
         appearance_setter(appearance_weight_for_epoch(config, epoch))
+    residual_setter = getattr(
+        model,
+        "set_correspondence_feature_residual_weight",
+        None,
+    )
+    if residual_setter is not None:
+        residual_setter(feature_residual_weight_for_epoch(config, epoch))
     return temperature
 
 
@@ -621,6 +677,7 @@ __all__ = [
     "correspondence_temperature_for_epoch",
     "cuda_autocast",
     "finite_mean",
+    "feature_residual_weight_for_epoch",
     "learning_rate_factor",
     "load_json",
     "make_grad_scaler",

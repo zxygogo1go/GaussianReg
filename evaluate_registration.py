@@ -260,16 +260,41 @@ def main(expected_architecture: Optional[str] = None) -> None:
             configured_appearance_weight = float(
                 checkpoint_appearance_weight
             )
+    configured_feature_residual_weight = getattr(
+        getattr(model, "correspondence", None),
+        "feature_residual_weight",
+        None,
+    )
+    checkpoint_feature_residual_weight = (
+        checkpoint.get("correspondence_feature_residual_weight")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if checkpoint_feature_residual_weight is not None:
+        setter = getattr(
+            model,
+            "set_correspondence_feature_residual_weight",
+            None,
+        )
+        if setter is not None:
+            setter(float(checkpoint_feature_residual_weight))
+            configured_feature_residual_weight = float(
+                checkpoint_feature_residual_weight
+            )
     if configured_temperature is not None:
         print(
             (
                 "correspondence_temperature=%.6f "
-                "appearance_weight=%s checkpoint_epoch=%d"
+                "appearance_weight=%s feature_residual_weight=%s "
+                "checkpoint_epoch=%d"
             )
             % (
                 configured_temperature,
                 "%.6f" % configured_appearance_weight
                 if configured_appearance_weight is not None
+                else "n/a",
+                "%.6f" % configured_feature_residual_weight
+                if configured_feature_residual_weight is not None
                 else "n/a",
                 checkpoint_epoch,
             )

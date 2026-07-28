@@ -43,7 +43,7 @@ G_i^s=(\mu_i^s,\Sigma_i^s,m_i^s,z_i^s,a_i^s).
 - \(z_i^s\): learned anatomy feature.
 - \(a_i^s\): Gaussian-window intensity/derivative measurements.
 
-Covariance is parameterized as:
+The implementation supports a learned covariance parameterization:
 
 \[
 \Sigma=R\,\mathrm{diag}(\sigma_D^2,\sigma_H^2,\sigma_W^2)R^\top+\epsilon I,
@@ -51,6 +51,11 @@ Covariance is parameterized as:
 
 where \(R\) is produced by the continuous 6D rotation representation and
 scales are strictly positive.
+
+Production v7 instead fixes centres, axis scales, identity rotations, and
+uniform mass to a canonical hierarchy. This removes image-dependent geometric
+degrees of freedom from the production matcher while retaining explicit SPD
+covariance tensors and Gaussian feature/appearance measurements.
 
 ### 3.2 Gaussian scale-space
 
@@ -67,15 +72,16 @@ At each level it measures:
 
 No trainable voxel convolution is used.
 
-### 3.3 Anatomy-adaptive hierarchy
+### 3.3 Anchored mass-conserving hierarchy
 
 - Root lattice: `4×4×4 = 64` primitives.
 - Each root produces four children: `256` primitives.
 - Each middle primitive produces four children: `1024` primitives.
 
-Children are initialized at tetrahedral offsets in the parent ellipsoid. Local
-Gaussian-window measurements and the parent feature predict bounded changes
-to center, scale, rotation, and mass.
+Children use fixed tetrahedral offsets inside each canonical parent. In
+production v7, local Gaussian-window measurements change the appearance and
+learned feature of a primitive but cannot move or resize it. The earlier
+anatomy-adaptive geometry predictor remains only for revision ablations.
 
 Mass is exactly conserved:
 
@@ -84,8 +90,10 @@ Mass is exactly conserved:
 \sum_i m_i^s=1.
 \]
 
-Scale-space reconstruction, coverage, and parent containment prevent collapse
-into arbitrary tokens or background-only primitives.
+Because production geometry is fixed, centre/scale/mass collapse is impossible
+by construction. Reconstruction, coverage, and parent containment remain
+reported representation diagnostics for historical ablations but have zero
+group weight in the v7 training objective.
 
 ### 3.4 Gaussian graph encoder
 
@@ -104,32 +112,45 @@ Parent features are explicitly propagated into the child level.
 The root level performs global all-to-all transport. For each finer level, the
 top parent transports define the admissible child correspondence mask.
 
-Production revision v6 combines a learned anatomy descriptor with a scheduled
-fixed appearance anchor. The anchor is the detached Gaussian-window
+Production revision v7 uses a fixed appearance/geometric base and a bounded
+learned residual. The appearance descriptor is the detached Gaussian-window
 intensity/derivative vector, standardized independently in each volume and
-L2-normalized. Its weight is high during initialization and annealed as the
-learned anatomy descriptor becomes task-conditioned. The matching cost is:
+L2-normalized. For pair \((i,j)\), the base cost is:
 
 \[
-C_{ij}
- =(1-\lambda_a)(1-\cos(z_i^f,z_j^m))
- +\lambda_a(1-\cos(\hat a_i^f,\hat a_j^m))
+C^{base}_{ij}
+ =(1-\cos(\hat a_i^f,\hat a_j^m))
 +\lambda_p\left\|
 \frac{\mu_i^f-\mu_j^m}{e}
 \right\|_2^2
 +\lambda_s\left\|\log\sigma_i^f-\log\sigma_j^m\right\|_2^2.
 \]
 
-Production v6 applies temperature-scaled row-softmax on the admissible support.
-Fine-level support contains only the strongest transported parents; unlike v5,
-the same-index parent is not inserted unconditionally. Forbidden entries are
-explicitly zeroed and renormalized, so sparse support cannot be undone by a
-marginal constraint. Fixed-to-moving and fixed-to-fixed calibration use the
-exact same support. Sinkhorn, dustbin, and mutual transport remain
-implementation ablations but are not in v6.
+The learned pair scorer receives eight values: appearance similarity, encoded
+feature similarity, three signed normalized centre offsets, normalized
+distance, log-scale cost, and the absolute difference of the first
+standardized appearance channel. Its residual is bounded:
+
+\[
+r_{ij}=r_{\max}\tanh f_\theta(x_{ij}),\qquad
+\ell_{ij}=-C^{base}_{ij}/T+\lambda_r r_{ij}.
+\]
+
+The final layer of \(f_\theta\) is initialized to zero and \(r_{\max}=2\).
+The residual multiplier \(\lambda_r\) is cosine-ramped from 0.1 to 1.0 over
+40 epochs. Therefore v7 initially reproduces the deterministic base matcher,
+and learned features can refine it while the base term remains present.
+
+Production v7 applies row-softmax on the admissible support. Fine-level support
+contains only the strongest transported parents; the same-index parent is not
+inserted unconditionally. Forbidden entries are explicitly zeroed and
+renormalized, so sparse support cannot be undone by a marginal constraint.
+Fixed-to-moving and fixed-to-fixed calibration use the exact same support.
+Sinkhorn, dustbin, and mutual transport remain implementation ablations but
+are not in v7.
 
 The transport yields matched moving features, centers, scales, and covariances
-for every fixed Gaussian. Expected transport cost is not optimized in v6
+for every fixed Gaussian. Expected transport cost is not optimized in v7
 because it admits uniform or feature-collapse shortcuts; registration
 similarity supplies the task gradient through the learned portion of the
 matching score.
@@ -157,9 +178,8 @@ while identical inputs have exactly zero calibrated transport displacement.
 
 ### 4.2 Anatomy-calibrated residual motion hierarchy
 
-Revision v6 computes scheduled appearance-anchored fixed-to-moving
-correspondence in the
-learned anatomical Gaussian frame. Its direct displacement is:
+Revision v7 computes fixed-base, residual-refined fixed-to-moving
+correspondence in the canonical Gaussian frame. Its direct displacement is:
 
 \[
 \Delta_i =
@@ -168,15 +188,15 @@ learned anatomical Gaussian frame. Its direct displacement is:
 \]
 
 The stopped fixed-to-fixed reference removes soft-correspondence barycentre
-bias and keeps identical-input direct displacement exactly zero. A same-index
-match still preserves the longitudinal difference between moving and fixed
-anatomical Gaussian centres. Mutual row/column plan multiplication is not used.
+bias and keeps identical-input direct displacement exactly zero. Since the v7
+geometry is shared and canonical, motion comes from differences between the
+cross-image and self-image transport distributions, not from predicted centre
+drift. Mutual row/column plan multiplication is not used.
 
-Explicit centre/scale matching costs are detached from geometry prediction so
-that geometry cannot directly lower those costs by moving itself. Geometry
-can still affect correspondence through Gaussian graph features. A low
-position weight is only a soft anatomical locality prior, and the matching
-temperature is cosine-annealed from 0.12 to 0.07.
+There is no geometry predictor in v7, so matching costs cannot be lowered by
+moving the primitives. A low position weight is only a soft anatomical
+locality prior, and the matching temperature is cosine-annealed from 0.12 to
+0.08.
 
 The root level predicts coarse motion. Middle and fine levels use the
 calibrated transport displacement relative to their parent. For candidate
@@ -201,9 +221,8 @@ v=v^{0}+\Delta v^{1}+\Delta v^{2}.
 This additive hierarchy avoids counting a global translation three times
 while preserving nonzero local motion at the middle and fine levels.
 
-The dense SVF is rasterized with canonical anchor centres, canonical scales,
-and uniform Gaussian mass. Learned centres determine transport motion but do
-not move the rasterization kernels themselves.
+The dense SVF is rasterized with the same canonical centres, scales, identity
+rotations, and uniform Gaussian mass used for representation and matching.
 
 ### 4.3 Gaussian velocity synthesis
 
@@ -254,10 +273,12 @@ The objective has four reported groups:
 2. **Representation**
    - scale-space reconstruction;
    - Gaussian coverage;
-   - parent/child containment.
+   - parent/child containment;
+   - reported for diagnostics, with production v7 group weight zero because
+     geometry is fixed.
 3. **Correspondence**
    - reported expected transport cost, cycle error, and hierarchy consistency;
-   - production v6 group weight is zero to avoid the self-minimizing
+   - production v7 group weight is zero to avoid the self-minimizing
      correspondence shortcut.
 4. **Deformation**
    - SVF derivative energy;
@@ -274,17 +295,21 @@ used only for response-aware Dice, HD95, and ASSD.
 - Gaussian counts: `64/256/1024`.
 - Feature width: 128.
 - Graph encoder: three blocks per level, eight heads, 16 neighbours.
+- Production geometry: anchored centres/scales, identity rotations, uniform
+  mass; no learned geometry predictor.
 - Production transport: strict-support row-softmax.
-- Fixed appearance weight: cosine 0.75 to 0.25 over 30 epochs.
-- Matching temperature: cosine 0.12 to 0.07 over 60 epochs.
-- Position weight: 0.05.
+- Fixed appearance base weight: 1.0 throughout training.
+- Learned residual multiplier: cosine 0.1 to 1.0 over 40 epochs.
+- Maximum learned residual logit before the multiplier: 2.0.
+- Matching temperature: cosine 0.12 to 0.08 over 60 epochs.
+- Position weight: 0.03.
 - Production dustbin mass: 0.
 - Production motion: translation-only local Gaussian residuals.
-- Direct residual fractions: 0.75/1.0/0.75 for root/middle/fine levels.
+- Direct residual fractions: 0.75/1.0/1.0 for root/middle/fine levels.
 - Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
 - Integration steps: 7.
-- Trainable parameters: 2,082,046.
+- Trainable parameters: 1,906,522.
 - Training autocast: bfloat16.
 - Geometry, transport, rasterization, integration, and NCC: float32.
 
@@ -304,7 +329,9 @@ Required ablations:
 - translation only versus SE(3) versus local affine velocity;
 - direct displacement versus stationary velocity integration;
 - without transport cycle/hierarchy consistency;
-- without inverse consistency.
+- without inverse consistency;
+- fixed-base matcher versus fixed-base plus learned residual scorer;
+- adaptive versus anchored Gaussian geometry.
 
 The implementation exposes `model.motion_mode` (`translation`, `se3`, or
 `affine`), `model.integration_mode` (`direct` or `svf`), and a zero

@@ -262,6 +262,7 @@ class HierarchicalGaussianDecomposer(nn.Module):
         samples_per_axis: int = 3,
         raster_chunk: int = 64,
         covariance_mode: str = "full",
+        geometry_mode: str = "adaptive",
     ) -> None:
         super().__init__()
         if int(children_per_parent) != 4:
@@ -274,18 +275,34 @@ class HierarchicalGaussianDecomposer(nn.Module):
         self.covariance_mode = str(covariance_mode).strip().lower()
         if self.covariance_mode not in {"diagonal", "full"}:
             raise ValueError("covariance_mode must be diagonal or full")
+        self.geometry_mode = str(geometry_mode).strip().lower()
+        if self.geometry_mode not in {"adaptive", "anchored"}:
+            raise ValueError("geometry_mode must be adaptive or anchored")
         self.pyramid = GaussianScaleSpace(factors=pyramid_factors)
         self.sampler = LocalGaussianSampler(samples_per_axis=samples_per_axis)
         descriptor_dim = (
             self.measurement_channels * self.sampler.descriptor_multiplier
         )
-        self.root_geometry = _GeometryPredictor(descriptor_dim, hidden_dim)
-        self.child_geometry = nn.ModuleList(
-            [
-                _GeometryPredictor(descriptor_dim + feature_dim, hidden_dim),
-                _GeometryPredictor(descriptor_dim + feature_dim, hidden_dim),
-            ]
-        )
+        if self.geometry_mode == "adaptive":
+            self.root_geometry = _GeometryPredictor(
+                descriptor_dim,
+                hidden_dim,
+            )
+            self.child_geometry = nn.ModuleList(
+                [
+                    _GeometryPredictor(
+                        descriptor_dim + feature_dim,
+                        hidden_dim,
+                    ),
+                    _GeometryPredictor(
+                        descriptor_dim + feature_dim,
+                        hidden_dim,
+                    ),
+                ]
+            )
+        else:
+            self.root_geometry = None
+            self.child_geometry = nn.ModuleList()
         feature_input_root = descriptor_dim + 6
         feature_input_child = descriptor_dim + feature_dim + 6
         self.root_feature = nn.Sequential(
@@ -342,27 +359,49 @@ class HierarchicalGaussianDecomposer(nn.Module):
             1, 1, 3, 3
         ).expand(batch, centers.shape[1], -1, -1)
         initial = self.sampler(measurements, centers, scales, rotations, extent_mm)
-        parameters = self.root_geometry(initial)
-        local_offset = torch.tanh(parameters[..., 0:3]) * scales * 0.35
-        centers = centers + local_offset
-        scales = scales * torch.exp(0.40 * torch.tanh(parameters[..., 3:6]))
-        minimum = spacing_dhw.unsqueeze(1) * 1.25
-        scales = torch.maximum(scales, minimum)
-        rotation_6d = identity_rotation_6d(
-            batch,
-            centers.shape[1],
-            device=centers.device,
-            dtype=centers.dtype,
-        ) + 0.25 * parameters[..., 6:12]
-        rotations = rotation_6d_to_matrix(rotation_6d)
-        if self.covariance_mode == "diagonal":
-            rotations = torch.eye(
-                3,
+        if self.geometry_mode == "anchored":
+            mass = centers.new_full(
+                (batch, centers.shape[1]),
+                1.0 / float(centers.shape[1]),
+            )
+            refined = initial
+        else:
+            if self.root_geometry is None:
+                raise AssertionError("adaptive geometry predictor is missing")
+            parameters = self.root_geometry(initial)
+            local_offset = torch.tanh(parameters[..., 0:3]) * scales * 0.35
+            centers = centers + local_offset
+            scales = scales * torch.exp(
+                0.40 * torch.tanh(parameters[..., 3:6])
+            )
+            minimum = spacing_dhw.unsqueeze(1) * 1.25
+            scales = torch.maximum(scales, minimum)
+            rotation_6d = identity_rotation_6d(
+                batch,
+                centers.shape[1],
                 device=centers.device,
                 dtype=centers.dtype,
-            ).view(1, 1, 3, 3).expand(batch, centers.shape[1], -1, -1)
-        mass = torch.softmax(parameters[..., 12], dim=1)
-        refined = self.sampler(measurements, centers, scales, rotations, extent_mm)
+            ) + 0.25 * parameters[..., 6:12]
+            rotations = rotation_6d_to_matrix(rotation_6d)
+            if self.covariance_mode == "diagonal":
+                rotations = torch.eye(
+                    3,
+                    device=centers.device,
+                    dtype=centers.dtype,
+                ).view(1, 1, 3, 3).expand(
+                    batch,
+                    centers.shape[1],
+                    -1,
+                    -1,
+                )
+            mass = torch.softmax(parameters[..., 12], dim=1)
+            refined = self.sampler(
+                measurements,
+                centers,
+                scales,
+                rotations,
+                extent_mm,
+            )
         normalized_center = physical_to_normalized(centers, extent_mm)
         normalized_scale = scales / extent_mm.unsqueeze(1).clamp_min(1.0e-6)
         features = self.root_feature(
@@ -412,50 +451,111 @@ class HierarchicalGaussianDecomposer(nn.Module):
         anchor_offset = anchor_offset * anchor_parent_scale * 0.72
         anchor_centers = anchor_parent_center + anchor_offset
         anchor_scales = anchor_parent_scale * 0.56
-        local_offset = offsets.view(1, parent_nodes * children, 3) * parent_scale * 0.72
-        world_offset = torch.einsum(
-            "bkij,bkj->bki",
-            parent_rotation,
-            local_offset,
-        )
-        centers = parent_center + world_offset
-        scales = parent_scale * 0.56
-        rotations = parent_rotation
-        initial = self.sampler(measurements, centers, scales, rotations, extent_mm)
-        parameters = self.child_geometry[child_stage](
-            torch.cat((initial, parent_feature), dim=-1)
-        )
-        residual_local = torch.tanh(parameters[..., 0:3]) * parent_scale * 0.22
-        centers = centers + torch.einsum(
-            "bkij,bkj->bki",
-            parent_rotation,
-            residual_local,
-        )
-        scales = scales * torch.exp(0.35 * torch.tanh(parameters[..., 3:6]))
-        scales = torch.minimum(scales, parent_scale * 0.82)
-        scales = torch.maximum(scales, spacing_dhw.unsqueeze(1) * 1.10)
-        delta_rotation = rotation_6d_to_matrix(
-            identity_rotation_6d(
-                batch,
-                parent_nodes * children,
-                device=centers.device,
-                dtype=centers.dtype,
-            )
-            + 0.20 * parameters[..., 6:12]
-        )
-        rotations = parent_rotation @ delta_rotation
-        if self.covariance_mode == "diagonal":
+        if self.geometry_mode == "anchored":
+            centers = anchor_centers
+            scales = anchor_scales
             rotations = torch.eye(
                 3,
                 device=centers.device,
                 dtype=centers.dtype,
-            ).view(1, 1, 3, 3).expand(batch, parent_nodes * children, -1, -1)
-        child_logits = parameters[..., 12].reshape(batch, parent_nodes, children)
-        child_fraction = torch.softmax(child_logits, dim=-1)
-        mass = (
-            parent.mass.unsqueeze(-1) * child_fraction
-        ).reshape(batch, parent_nodes * children)
-        refined = self.sampler(measurements, centers, scales, rotations, extent_mm)
+            ).view(1, 1, 3, 3).expand(
+                batch,
+                parent_nodes * children,
+                -1,
+                -1,
+            )
+            refined = self.sampler(
+                measurements,
+                centers,
+                scales,
+                rotations,
+                extent_mm,
+            )
+            mass = (
+                parent.mass.unsqueeze(-1)
+                .expand(-1, -1, children)
+                .reshape(batch, parent_nodes * children)
+                / float(children)
+            )
+        else:
+            local_offset = (
+                offsets.view(1, parent_nodes * children, 3)
+                * parent_scale
+                * 0.72
+            )
+            world_offset = torch.einsum(
+                "bkij,bkj->bki",
+                parent_rotation,
+                local_offset,
+            )
+            centers = parent_center + world_offset
+            scales = parent_scale * 0.56
+            rotations = parent_rotation
+            initial = self.sampler(
+                measurements,
+                centers,
+                scales,
+                rotations,
+                extent_mm,
+            )
+            parameters = self.child_geometry[child_stage](
+                torch.cat((initial, parent_feature), dim=-1)
+            )
+            residual_local = (
+                torch.tanh(parameters[..., 0:3])
+                * parent_scale
+                * 0.22
+            )
+            centers = centers + torch.einsum(
+                "bkij,bkj->bki",
+                parent_rotation,
+                residual_local,
+            )
+            scales = scales * torch.exp(
+                0.35 * torch.tanh(parameters[..., 3:6])
+            )
+            scales = torch.minimum(scales, parent_scale * 0.82)
+            scales = torch.maximum(
+                scales,
+                spacing_dhw.unsqueeze(1) * 1.10,
+            )
+            delta_rotation = rotation_6d_to_matrix(
+                identity_rotation_6d(
+                    batch,
+                    parent_nodes * children,
+                    device=centers.device,
+                    dtype=centers.dtype,
+                )
+                + 0.20 * parameters[..., 6:12]
+            )
+            rotations = parent_rotation @ delta_rotation
+            if self.covariance_mode == "diagonal":
+                rotations = torch.eye(
+                    3,
+                    device=centers.device,
+                    dtype=centers.dtype,
+                ).view(1, 1, 3, 3).expand(
+                    batch,
+                    parent_nodes * children,
+                    -1,
+                    -1,
+                )
+            child_logits = parameters[..., 12].reshape(
+                batch,
+                parent_nodes,
+                children,
+            )
+            child_fraction = torch.softmax(child_logits, dim=-1)
+            mass = (
+                parent.mass.unsqueeze(-1) * child_fraction
+            ).reshape(batch, parent_nodes * children)
+            refined = self.sampler(
+                measurements,
+                centers,
+                scales,
+                rotations,
+                extent_mm,
+            )
         normalized_center = physical_to_normalized(centers, extent_mm)
         normalized_scale = scales / extent_mm.unsqueeze(1).clamp_min(1.0e-6)
         features = self.child_feature[child_stage](

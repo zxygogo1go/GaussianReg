@@ -12,6 +12,7 @@ from experiment_utils import (
     config_architecture,
     configure_model_for_epoch,
     correspondence_temperature_for_epoch,
+    feature_residual_weight_for_epoch,
     learning_rate_factor,
     warp_volume,
 )
@@ -220,6 +221,60 @@ class ExperimentUtilityTests(unittest.TestCase):
         configure_model_for_epoch(model, config, 5)
         self.assertAlmostEqual(model.correspondence.appearance_weight, 0.25)
 
+    def test_v7_builder_uses_anchored_residual_pair_matching(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v7",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "appearance_residual",
+                "appearance_weight": 1.0,
+                "feature_residual_weight": 0.1,
+                "feature_residual_weight_end": 1.0,
+                "feature_residual_weight_anneal_epochs": 5,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "match_evidence_power": 0.5,
+                "motion_mode": "translation",
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v7")
+        self.assertEqual(model.decomposer.geometry_mode, "anchored")
+        self.assertIsNone(model.decomposer.root_geometry)
+        self.assertEqual(model.correspondence.coordinate_mode, "canonical")
+        self.assertFalse(model.correspondence.include_identity_candidate)
+        for matcher in model.correspondence.matchers:
+            self.assertEqual(matcher.score_mode, "appearance_residual")
+            self.assertIsNotNone(matcher.pair_residual_score)
+        configure_model_for_epoch(model, config, 1)
+        self.assertAlmostEqual(
+            model.correspondence.feature_residual_weight,
+            0.1,
+        )
+        configure_model_for_epoch(model, config, 5)
+        self.assertAlmostEqual(
+            model.correspondence.feature_residual_weight,
+            1.0,
+        )
+
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {
             "model": {
@@ -261,6 +316,33 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(appearance_weight_for_epoch(config, 50), 0.25)
         with self.assertRaises(ValueError):
             appearance_weight_for_epoch(config, 0)
+
+    def test_feature_residual_weight_schedule_boundaries(self):
+        config = {
+            "model": {
+                "feature_residual_weight": 0.1,
+                "feature_residual_weight_end": 1.0,
+                "feature_residual_weight_anneal_epochs": 5,
+            }
+        }
+        self.assertAlmostEqual(
+            feature_residual_weight_for_epoch(config, 1),
+            0.1,
+        )
+        self.assertAlmostEqual(
+            feature_residual_weight_for_epoch(config, 3),
+            0.55,
+        )
+        self.assertAlmostEqual(
+            feature_residual_weight_for_epoch(config, 5),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            feature_residual_weight_for_epoch(config, 50),
+            1.0,
+        )
+        with self.assertRaises(ValueError):
+            feature_residual_weight_for_epoch(config, 0)
 
     def test_identity_collapse_warning_requires_joint_signature(self):
         train = {

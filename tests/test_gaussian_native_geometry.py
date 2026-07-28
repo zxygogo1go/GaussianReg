@@ -89,6 +89,62 @@ class GaussianNativeGeometryTests(unittest.TestCase):
             )
         )
 
+    def test_anchored_geometry_is_exact_and_has_no_geometry_predictor(self):
+        decomposer = HierarchicalGaussianDecomposer(
+            root_grid_shape=(2, 2, 2),
+            feature_dim=24,
+            hidden_dim=32,
+            pyramid_factors=(8, 4, 2),
+            samples_per_axis=2,
+            raster_chunk=16,
+            geometry_mode="anchored",
+        )
+        self.assertIsNone(decomposer.root_geometry)
+        self.assertEqual(len(decomposer.child_geometry), 0)
+        first = decomposer(
+            torch.rand(1, 1, 32, 32, 32),
+            torch.tensor([[1.5, 1.5, 1.5]]),
+            compute_reconstruction=False,
+        )
+        second = decomposer(
+            torch.rand(1, 1, 32, 32, 32),
+            torch.tensor([[1.5, 1.5, 1.5]]),
+            compute_reconstruction=False,
+        )
+        for first_level, second_level in zip(
+            first["levels"],
+            second["levels"],
+        ):
+            self.assertTrue(
+                torch.equal(
+                    first_level.centers_mm,
+                    first_level.anchor_centers_mm,
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    first_level.scales_mm,
+                    first_level.anchor_scales_mm,
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    first_level.centers_mm,
+                    second_level.centers_mm,
+                )
+            )
+            expected_mass = torch.full_like(
+                first_level.mass,
+                1.0 / float(first_level.mass.shape[1]),
+            )
+            self.assertTrue(
+                torch.allclose(
+                    first_level.mass,
+                    expected_mass,
+                    atol=1.0e-7,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

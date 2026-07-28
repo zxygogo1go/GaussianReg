@@ -560,6 +560,9 @@ def _checkpoint(
         "correspondence_appearance_weight": train_metrics.get(
             "correspondence_appearance_weight"
         ),
+        "correspondence_feature_residual_weight": train_metrics.get(
+            "correspondence_feature_residual_weight"
+        ),
         "train_metrics": dict(train_metrics),
         "validation_metrics": dict(validation_metrics),
     }
@@ -740,6 +743,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 "appearance_weight",
                 None,
             )
+            match_feature_residual_weight = getattr(
+                getattr(model, "correspondence", None),
+                "feature_residual_weight",
+                None,
+            )
             lr = float(optimizer.param_groups[0]["lr"])
             train_metrics = _train_epoch(
                 model,
@@ -763,6 +771,10 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 train_metrics["correspondence_appearance_weight"] = float(
                     match_appearance_weight
                 )
+            if match_feature_residual_weight is not None:
+                train_metrics[
+                    "correspondence_feature_residual_weight"
+                ] = float(match_feature_residual_weight)
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:
                 validation_metrics = _validate(
@@ -857,10 +869,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 validation_metrics.get("p95_displacement_mm", float("nan"))
             )
             print(
-                "epoch %d complete lr=%.3e match_temp=%s appearance=%s val_ncc=%s "
+                "epoch %d complete lr=%.3e match_temp=%s appearance=%s "
+                "feature_residual=%s val_ncc=%s "
                 "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
                 "raw_e=%.4f/%.4f/%.4f motion_e=%.4f/%.4f/%.4f "
-                "diag0=%.4f delta0_mm=%.3f anchor2=%.3f "
+                "diag0=%.4f residual0=%.3f delta0_mm=%.3f anchor2=%.3f "
                 "ncc_gain=%.5f dice_gain=%.5f "
                 "fold=%.6f best=%.5f"
                 % (
@@ -871,6 +884,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     else "n/a",
                     "%.4f" % match_appearance_weight
                     if match_appearance_weight is not None
+                    else "n/a",
+                    "%.4f" % match_feature_residual_weight
+                    if match_feature_residual_weight is not None
                     else "n/a",
                     "%.5f" % score if np.isfinite(score) else "not-run",
                     "%.5f" % validation_dice
@@ -936,6 +952,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     float(
                         train_metrics.get(
                             "diagonal_probability_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "feature_residual_logit_l0",
                             float("nan"),
                         )
                     ),

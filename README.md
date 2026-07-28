@@ -10,7 +10,7 @@ Moving / Fixed volume
         ↓
 Gaussian scale-space and derivative measurements
         ↓
-Hierarchical anisotropic Gaussian decomposition
+Hierarchical anchored Gaussian decomposition
 64 → 256 → 1024 primitives
         ↓
 Gaussian graph encoding
@@ -28,10 +28,12 @@ Dense diffeomorphic deformation
 
 The implementation is organized around two research modules:
 
-1. **Hierarchical Gaussian Representation and Correspondence (HGRC)** learns
-   full-covariance, mass-conserving Gaussian anatomy hierarchies and explicit
-   coarse-to-fine correspondence. The production path uses strict sparse
-   candidate support; Sinkhorn and an unmatched dustbin remain ablations.
+1. **Hierarchical Gaussian Representation and Correspondence (HGRC)** encodes
+   fixed, mass-conserving Gaussian anatomy hierarchies and learns explicit
+   coarse-to-fine Gaussian-to-Gaussian correspondence. The production path
+   uses strict sparse candidate support and a bounded learned residual on top
+   of a fixed appearance/geometric matching base; Sinkhorn and an unmatched
+   dustbin remain ablations.
 2. **Gaussian Stationary Velocity Field Generator (GSVF)** predicts
    translation, rotation, and bounded strain for every Gaussian, rasterizes
    coarse-to-fine residual velocities, and integrates the SVF into a
@@ -79,25 +81,27 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
-The current production revision is v6. It retains v5's masked row-softmax and
-shared fixed-to-moving/fixed-to-fixed support, but removes the forced identity
-parent candidate. Normalized Gaussian intensity/derivative measurements anchor
-early matching and are cosine-annealed from weight 0.75 to 0.25 over 30
-epochs, allowing learned anatomy features to take over. Candidate-normalized
-entropy remains a deterministic ambiguity statistic, but its square root
-weights motion so uncertain child residuals are not suppressed linearly.
-Middle/fine direct residual capacity is increased while the root contribution
-is slightly reduced. Canonical anchors remain the stable velocity
-rasterization basis, and a stronger representation anchor prevents the
-fine-Gaussian drift observed in v5. Matching temperature is annealed from 0.12
-to 0.07 over 60 epochs. Earlier revisions remain available only for
-reproducing prior experiments.
+The current production revision is v7. It keeps v6's strict masked
+row-softmax, shared fixed-to-moving/fixed-to-fixed support, no forced identity
+candidate, and square-root match evidence. Gaussian centres, scales, rotations,
+and masses are now locked to the canonical 64/256/1024 hierarchy, eliminating
+the geometry-prediction shortcut and the anchor drift observed in v5/v6.
+
+Normalized Gaussian intensity/derivative correlation remains a fixed matching
+base throughout training. A zero-initialized pair scorer learns only a bounded
+residual logit from appearance similarity, encoded-feature similarity, signed
+relative position, distance, scale discrepancy, and intensity discrepancy.
+Its weight is cosine-ramped from 0.1 to 1.0 over 40 epochs, so the model starts
+from the validated deterministic matcher without allowing learned features to
+replace that base. Matching temperature is annealed from 0.12 to 0.08 over 60
+epochs. Earlier revisions remain available only for reproducing prior
+experiments.
 
 First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_v6_hntsmrg24.json \
+  --config configs/gaussian_native_v7_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -106,21 +110,22 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v6_hntsmrg24.json \
+  --config configs/gaussian_native_v7_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v6_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v7_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
-The production model contains 64/256/1024 Gaussian primitives and about 2.08
-million trainable parameters. Training uses:
+The production model contains 64/256/1024 Gaussian primitives and 1,906,522
+trainable parameters. Training uses:
 
 - bidirectional multi-scale LNCC and normalized-gradient similarity;
-- Gaussian reconstruction, coverage, and hierarchy containment;
-- appearance-anchored sparse Gaussian correspondence, trained through image
-  similarity rather than a self-minimizing transport-cost loss;
+- an anchored, mass-conserving Gaussian hierarchy without learned geometry
+  predictors;
+- fixed-base plus bounded-residual sparse Gaussian correspondence, trained
+  through image similarity rather than a self-minimizing transport-cost loss;
 - SVF smoothness, inverse consistency, and a Jacobian safety barrier;
 - shared left-right flipping and shared MRI intensity augmentation.
 
@@ -128,9 +133,10 @@ Each validation record includes NCC and Dice before/after registration,
 improvements, displacement, and topology. The console also reports coarse
 support-normalized matching entropy, deterministic match evidence, row maximum,
 effective motion evidence, diagonal probability, and calibrated transport
-displacement. Clearly harmful or stalled runs are stopped by configured
-fail-fast rules and retain a `failed_epoch_XXXX.pt` checkpoint with the exact
-reason.
+displacement. v7 additionally logs the mean absolute learned residual logit,
+which should be exactly zero before the first update and then become nonzero.
+Clearly harmful or stalled runs are stopped by configured fail-fast rules and
+retain a `failed_epoch_XXXX.pt` checkpoint with the exact reason.
 
 The best checkpoint is selected by validation NCC, not tumor Dice, and is
 written only when NCC improves over the unregistered pair and the negative
@@ -139,13 +145,13 @@ manifest hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v6_hntsmrg24.json \
+  --config configs/gaussian_native_v7_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v6_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v7_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v6_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v7_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -154,10 +160,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v6_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v7_hntsmrg24_seed2026/best_validation_ncc.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v6_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v7_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```
