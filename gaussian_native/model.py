@@ -66,6 +66,10 @@ class GaussianNativeRegistration(nn.Module):
         feature_residual_weight: float = 0.0,
         max_feature_residual_logit: float = 2.0,
         pair_score_hidden_dim: int = 32,
+        pair_context_dim: Optional[int] = None,
+        pair_score_heads: int = 4,
+        pair_fusion_hidden_dim: Optional[int] = None,
+        pair_context_temperature: float = 0.20,
         include_identity_candidate: Optional[bool] = None,
         match_evidence_power: float = 1.0,
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
@@ -86,6 +90,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v6",
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -96,6 +101,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v6",
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -104,6 +110,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v6",
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -112,17 +119,20 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v6",
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         use_residual_pair_motion = self.architecture_revision in {
             "gaussian_native_v7",
             "gaussian_native_v8",
+            "gaussian_native_v9",
         }
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
@@ -215,6 +225,10 @@ class GaussianNativeRegistration(nn.Module):
             ),
             max_feature_residual_logit=max_feature_residual_logit,
             pair_score_hidden_dim=pair_score_hidden_dim,
+            pair_context_dim=pair_context_dim,
+            pair_score_heads=pair_score_heads,
+            pair_fusion_hidden_dim=pair_fusion_hidden_dim,
+            pair_context_temperature=pair_context_temperature,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,

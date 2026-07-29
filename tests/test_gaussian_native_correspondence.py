@@ -385,6 +385,59 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
             self.assertIsNotNone(final.weight.grad)
             self.assertGreater(float(final.weight.grad.abs().sum()), 0.0)
 
+    def test_v9_contextual_pair_scorer_is_bounded_and_trainable(self):
+        fixed, extent = self._represent(
+            torch.rand(1, 1, 32, 32, 32)
+        )
+        moving, _ = self._represent(
+            torch.rand(1, 1, 32, 32, 32)
+        )
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.15,
+            position_weight=0.03,
+            scale_weight=0.02,
+            dustbin_mass=0.0,
+            parent_candidates=2,
+            identity_calibration=True,
+            coordinate_mode="canonical",
+            detach_geometry_cost=True,
+            appearance_weight=0.85,
+            transport_mode="row_softmax",
+            shared_calibration_candidates=True,
+            include_identity_candidate=False,
+            score_mode="contextual_residual",
+            feature_residual_weight=0.15,
+            max_feature_residual_logit=2.5,
+            pair_score_hidden_dim=32,
+            pair_context_dim=32,
+            pair_score_heads=4,
+            pair_fusion_hidden_dim=48,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            self.assertEqual(
+                float(result["feature_residual_logit"].abs().max()),
+                0.0,
+            )
+            self.assertTrue(
+                torch.isfinite(
+                    result["context_attention_concentration"]
+                )
+            )
+        loss = sum(
+            result["feature_residual_score"].sum()
+            for result in results
+        )
+        loss.backward()
+        for level_matcher in matcher.matchers:
+            final = level_matcher.pair_residual_score[-1]
+            self.assertIsNotNone(final.weight.grad)
+            self.assertGreater(
+                float(final.weight.grad.abs().sum()),
+                0.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

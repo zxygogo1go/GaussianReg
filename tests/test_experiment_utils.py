@@ -23,6 +23,9 @@ from train_registration import (
     _collapse_warning,
     _configure_training_stage,
     _fail_fast_reason,
+    _make_synthetic_deformation_pair,
+    _sample_flow_mm_at_centers,
+    _synthetic_deformation_probability,
 )
 
 
@@ -338,6 +341,141 @@ class ExperimentUtilityTests(unittest.TestCase):
                 for parameter in model.velocity_head.parameters()
             )
         )
+
+    def test_v9_builder_uses_contextual_matching_capacity(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v9",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "contextual_residual",
+                "appearance_weight": 0.85,
+                "feature_residual_weight": 0.15,
+                "pair_score_hidden_dim": 32,
+                "pair_context_dim": 32,
+                "pair_score_heads": 4,
+                "pair_fusion_hidden_dim": 48,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "motion_mode": "translation",
+            },
+            "synthetic_deformation": {
+                "enabled": True,
+                "warmup_epochs": 2,
+                "probability_after_warmup": 0.25,
+                "active_until_epoch": 4,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(
+            model.architecture_revision,
+            "gaussian_native_v9",
+        )
+        for matcher in model.correspondence.matchers:
+            self.assertEqual(
+                matcher.score_mode,
+                "contextual_residual",
+            )
+            self.assertEqual(matcher.context_dim, 32)
+            self.assertEqual(matcher.pair_score_heads, 4)
+        warmup = _configure_training_stage(model, config, 1)
+        self.assertEqual(
+            warmup["name"],
+            "synthetic_deformation_warmup",
+        )
+        self.assertTrue(warmup["velocity_head_trainable"])
+        self.assertEqual(
+            warmup["synthetic_deformation_probability"],
+            1.0,
+        )
+        mixed = _configure_training_stage(model, config, 3)
+        self.assertEqual(
+            mixed["name"],
+            "joint_with_synthetic_deformation",
+        )
+        self.assertEqual(
+            mixed["synthetic_deformation_probability"],
+            0.25,
+        )
+
+    def test_synthetic_deformation_schedule_and_pair_are_exact(self):
+        schedule = {
+            "enabled": True,
+            "warmup_epochs": 2,
+            "probability_after_warmup": 0.25,
+            "active_until_epoch": 4,
+        }
+        self.assertEqual(
+            _synthetic_deformation_probability(schedule, 1),
+            1.0,
+        )
+        self.assertEqual(
+            _synthetic_deformation_probability(schedule, 3),
+            0.25,
+        )
+        self.assertEqual(
+            _synthetic_deformation_probability(schedule, 5),
+            0.0,
+        )
+        torch.manual_seed(23)
+        moving = torch.rand(1, 1, 16, 16, 16)
+        fixed = torch.rand_like(moving)
+        spacing = torch.tensor([1.5, 1.5, 1.5])
+        synthetic_moving, synthetic_fixed, target = (
+            _make_synthetic_deformation_pair(
+                moving,
+                fixed,
+                spacing,
+                {
+                    "control_grid_shape": [3, 3, 3],
+                    "local_velocity_mm_range": [1.0, 1.0],
+                    "translation_velocity_mm_range": [0.0, 0.0],
+                    "integration_steps": 3,
+                },
+            )
+        )
+        reconstructed = warp_volume(synthetic_moving, target)
+        self.assertTrue(
+            torch.allclose(
+                synthetic_fixed,
+                reconstructed,
+                atol=1.0e-5,
+            )
+        )
+        self.assertGreater(float(target.abs().max()), 0.0)
+
+        constant_flow = torch.zeros(1, 3, 8, 8, 8)
+        constant_flow[:, 0] = 2.0
+        centers = torch.tensor(
+            [[[0.0, 0.0, 0.0], [10.5, 10.5, 10.5]]]
+        )
+        sampled = _sample_flow_mm_at_centers(
+            constant_flow,
+            spacing,
+            centers,
+            torch.tensor([[10.5, 10.5, 10.5]]),
+        )
+        expected = torch.tensor(
+            [[[3.0, 0.0, 0.0], [3.0, 0.0, 0.0]]]
+        )
+        self.assertTrue(torch.allclose(sampled, expected))
 
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {

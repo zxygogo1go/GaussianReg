@@ -17,13 +17,17 @@ from experiment_utils import (
     resolve_device,
     set_reproducibility,
 )
+from train_registration import (
+    _make_synthetic_deformation_pair,
+    _synthetic_supervision,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v8_hntsmrg24.json",
+        default="configs/gaussian_native_v9_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -51,6 +55,17 @@ def main() -> None:
     generator.manual_seed(seed)
     moving = torch.rand((1, 1, *shape), generator=generator, device=device)
     fixed = torch.rand((1, 1, *shape), generator=generator, device=device)
+    synthetic_config = dict(
+        config.get("synthetic_deformation", {})
+    )
+    target_flow = None
+    if bool(synthetic_config.get("enabled", False)):
+        moving, fixed, target_flow = _make_synthetic_deformation_pair(
+            moving,
+            fixed,
+            model.spacing_dhw,
+            synthetic_config,
+        )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -62,6 +77,31 @@ def main() -> None:
     ):
         output = model(moving, fixed, return_aux=True)
         terms = objective(output, moving, fixed)
+        if target_flow is not None:
+            terms = dict(terms)
+            synthetic_terms = _synthetic_supervision(
+                output,
+                target_flow,
+                model.spacing_dhw,
+            )
+            terms.update(synthetic_terms)
+            terms["total"] = (
+                terms["total"]
+                + float(
+                    synthetic_config.get(
+                        "flow_loss_weight",
+                        0.0,
+                    )
+                )
+                * terms["synthetic_flow"]
+                + float(
+                    synthetic_config.get(
+                        "correspondence_loss_weight",
+                        0.0,
+                    )
+                )
+                * terms["synthetic_correspondence"]
+            )
     terms["total"].backward()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -126,6 +166,7 @@ def main() -> None:
                     "match_evidence_",
                     "motion_evidence_",
                     "feature_residual_logit_",
+                    "context_attention_concentration_",
                     "row_max_probability_",
                     "support_size_",
                     "diagonal_probability_",

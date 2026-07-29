@@ -235,6 +235,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v6",
         "gaussian_native_v7",
         "gaussian_native_v8",
+        "gaussian_native_v9",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -284,6 +285,20 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         ),
         pair_score_hidden_dim=int(
             model.get("pair_score_hidden_dim", 32)
+        ),
+        pair_context_dim=(
+            None
+            if model.get("pair_context_dim") is None
+            else int(model["pair_context_dim"])
+        ),
+        pair_score_heads=int(model.get("pair_score_heads", 4)),
+        pair_fusion_hidden_dim=(
+            None
+            if model.get("pair_fusion_hidden_dim") is None
+            else int(model["pair_fusion_hidden_dim"])
+        ),
+        pair_context_temperature=float(
+            model.get("pair_context_temperature", 0.20)
         ),
         include_identity_candidate=(
             None
@@ -478,6 +493,15 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
                 .float()
                 .abs()
                 .mean()
+                .cpu()
+            )
+        if "context_attention_concentration" in result:
+            diagnostics[
+                "context_attention_concentration_l%d" % index
+            ] = float(
+                result["context_attention_concentration"]
+                .detach()
+                .float()
                 .cpu()
             )
         if plan.shape[1] == plan.shape[2]:

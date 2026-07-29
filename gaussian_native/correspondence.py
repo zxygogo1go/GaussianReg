@@ -32,6 +32,10 @@ class PartialSinkhornMatcher(nn.Module):
         feature_residual_weight: float = 0.0,
         max_feature_residual_logit: float = 2.0,
         pair_score_hidden_dim: int = 32,
+        pair_context_dim: Optional[int] = None,
+        pair_score_heads: int = 4,
+        pair_fusion_hidden_dim: Optional[int] = None,
+        pair_context_temperature: float = 0.20,
     ) -> None:
         super().__init__()
         if not 0.0 <= dustbin_mass < 0.5:
@@ -57,9 +61,14 @@ class PartialSinkhornMatcher(nn.Module):
         if self.transport_mode == "row_softmax" and self.dustbin_mass:
             raise ValueError("row_softmax requires dustbin_mass=0")
         self.score_mode = str(score_mode).strip().lower()
-        if self.score_mode not in {"convex", "appearance_residual"}:
+        if self.score_mode not in {
+            "convex",
+            "appearance_residual",
+            "contextual_residual",
+        }:
             raise ValueError(
-                "score_mode must be convex or appearance_residual"
+                "score_mode must be convex, appearance_residual, or "
+                "contextual_residual"
             )
         self.feature_residual_weight = float(feature_residual_weight)
         if self.feature_residual_weight < 0.0:
@@ -79,6 +88,84 @@ class PartialSinkhornMatcher(nn.Module):
                 nn.Linear(8, int(pair_score_hidden_dim)),
                 nn.GELU(),
                 nn.Linear(int(pair_score_hidden_dim), 1),
+            )
+            final = self.pair_residual_score[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+        elif self.score_mode == "contextual_residual":
+            context_dim = (
+                int(feature_dim)
+                if pair_context_dim is None
+                else int(pair_context_dim)
+            )
+            heads = int(pair_score_heads)
+            fusion_hidden_dim = (
+                2 * int(feature_dim)
+                if pair_fusion_hidden_dim is None
+                else int(pair_fusion_hidden_dim)
+            )
+            hidden_dim = int(pair_score_hidden_dim)
+            if (
+                context_dim <= 0
+                or heads <= 0
+                or context_dim % heads
+                or fusion_hidden_dim <= 0
+                or hidden_dim <= 1
+                or pair_context_temperature <= 0.0
+            ):
+                raise ValueError(
+                    "invalid contextual pair scorer dimensions or temperature"
+                )
+            self.context_dim = context_dim
+            self.pair_score_heads = heads
+            self.pair_context_temperature = float(
+                pair_context_temperature
+            )
+            self.context_feature_norm = nn.LayerNorm(feature_dim)
+            self.context_query = nn.Linear(
+                feature_dim,
+                context_dim,
+                bias=False,
+            )
+            self.context_key = nn.Linear(
+                feature_dim,
+                context_dim,
+                bias=False,
+            )
+            self.context_value = nn.Linear(
+                feature_dim,
+                context_dim,
+                bias=False,
+            )
+            self.context_output = nn.Linear(
+                context_dim,
+                feature_dim,
+                bias=False,
+            )
+            self.node_fusion = nn.Sequential(
+                nn.Linear(4 * feature_dim, fusion_hidden_dim),
+                nn.GELU(),
+                nn.Linear(fusion_hidden_dim, feature_dim),
+            )
+            self.refined_feature_norm = nn.LayerNorm(feature_dim)
+            self.refined_query = nn.Linear(
+                feature_dim,
+                context_dim,
+                bias=False,
+            )
+            self.refined_key = nn.Linear(
+                feature_dim,
+                context_dim,
+                bias=False,
+            )
+            pair_metric_dim = 2 * heads + 12
+            self.pair_residual_score = nn.Sequential(
+                nn.Linear(pair_metric_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, max(hidden_dim // 2, 1)),
+                nn.GELU(),
+                nn.Linear(max(hidden_dim // 2, 1), 1),
             )
             final = self.pair_residual_score[-1]
             nn.init.zeros_(final.weight)
@@ -189,6 +276,171 @@ class PartialSinkhornMatcher(nn.Module):
         plan = row_probability * fixed_mass.float().unsqueeze(2)
         return F.pad(plan, (0, 1, 0, 1))
 
+    def _contextual_pair_features(
+        self,
+        fixed: GaussianLevel,
+        moving: GaussianLevel,
+        appearance_similarity: torch.Tensor,
+        feature_similarity: torch.Tensor,
+        center_delta: torch.Tensor,
+        position_cost: torch.Tensor,
+        log_scale_delta: torch.Tensor,
+        scale_cost: torch.Tensor,
+        fixed_appearance: torch.Tensor,
+        moving_appearance: torch.Tensor,
+        candidate_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build bidirectional cross-Gaussian context and dense pair metrics."""
+        if self.score_mode != "contextual_residual":
+            raise AssertionError("contextual scorer is not enabled")
+        head_dim = self.context_dim // self.pair_score_heads
+
+        fixed_normalized = self.context_feature_norm(fixed.features)
+        moving_normalized = self.context_feature_norm(moving.features)
+        fixed_query = F.normalize(
+            self.context_query(fixed_normalized).reshape(
+                *fixed.features.shape[:2],
+                self.pair_score_heads,
+                head_dim,
+            ),
+            dim=-1,
+        )
+        moving_key = F.normalize(
+            self.context_key(moving_normalized).reshape(
+                *moving.features.shape[:2],
+                self.pair_score_heads,
+                head_dim,
+            ),
+            dim=-1,
+        )
+        initial_head_similarity = torch.einsum(
+            "bihd,bjhd->bijh",
+            fixed_query,
+            moving_key,
+        )
+        context_logits = (
+            initial_head_similarity.mean(dim=-1)
+            + appearance_similarity
+            - self.position_weight * position_cost
+            - self.scale_weight * scale_cost
+        ) / self.pair_context_temperature
+        if candidate_mask is not None:
+            context_logits = context_logits.masked_fill(
+                ~candidate_mask,
+                -1.0e4,
+            )
+        row_attention = torch.softmax(context_logits.float(), dim=2)
+        column_attention = torch.softmax(context_logits.float(), dim=1)
+        if candidate_mask is not None:
+            valid = candidate_mask.float()
+            row_attention = row_attention * valid
+            row_attention = row_attention / row_attention.sum(
+                dim=2,
+                keepdim=True,
+            ).clamp_min(1.0e-8)
+            column_attention = column_attention * valid
+            column_attention = column_attention / column_attention.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1.0e-8)
+
+        fixed_value = self.context_value(fixed_normalized)
+        moving_value = self.context_value(moving_normalized)
+        fixed_context = torch.einsum(
+            "bij,bjc->bic",
+            row_attention,
+            moving_value.float(),
+        )
+        moving_context = torch.einsum(
+            "bij,bic->bjc",
+            column_attention,
+            fixed_value.float(),
+        )
+        fixed_context = self.context_output(
+            fixed_context.to(fixed.features.dtype)
+        )
+        moving_context = self.context_output(
+            moving_context.to(moving.features.dtype)
+        )
+
+        fixed_update = self.node_fusion(
+            torch.cat(
+                (
+                    fixed.features,
+                    fixed_context,
+                    fixed.features - fixed_context,
+                    fixed.features * fixed_context,
+                ),
+                dim=-1,
+            )
+        )
+        moving_update = self.node_fusion(
+            torch.cat(
+                (
+                    moving.features,
+                    moving_context,
+                    moving.features - moving_context,
+                    moving.features * moving_context,
+                ),
+                dim=-1,
+            )
+        )
+        refined_fixed = self.refined_feature_norm(
+            fixed.features + fixed_update
+        )
+        refined_moving = self.refined_feature_norm(
+            moving.features + moving_update
+        )
+        refined_query = F.normalize(
+            self.refined_query(refined_fixed).reshape(
+                *fixed.features.shape[:2],
+                self.pair_score_heads,
+                head_dim,
+            ),
+            dim=-1,
+        )
+        refined_key = F.normalize(
+            self.refined_key(refined_moving).reshape(
+                *moving.features.shape[:2],
+                self.pair_score_heads,
+                head_dim,
+            ),
+            dim=-1,
+        )
+        refined_head_similarity = torch.einsum(
+            "bihd,bjhd->bijh",
+            refined_query,
+            refined_key,
+        )
+        appearance_delta = (
+            fixed_appearance[..., 0].unsqueeze(2)
+            - moving_appearance[..., 0].unsqueeze(1)
+        ).abs()
+        log_mass_delta = (
+            torch.log(fixed.mass.clamp_min(1.0e-8)).unsqueeze(2)
+            - torch.log(moving.mass.clamp_min(1.0e-8)).unsqueeze(1)
+        ).abs()
+        pair_metrics = torch.cat(
+            (
+                initial_head_similarity,
+                refined_head_similarity,
+                appearance_similarity.unsqueeze(-1),
+                feature_similarity.unsqueeze(-1),
+                center_delta,
+                position_cost.sqrt().unsqueeze(-1),
+                log_scale_delta,
+                scale_cost.unsqueeze(-1),
+                appearance_delta.unsqueeze(-1),
+                log_mass_delta.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        concentration = 0.5 * (
+            row_attention.max(dim=2).values.mean()
+            + column_attention.max(dim=1).values.mean()
+        )
+        return pair_metrics, concentration
+
     def forward(
         self,
         fixed: GaussianLevel,
@@ -199,10 +451,10 @@ class PartialSinkhornMatcher(nn.Module):
         fixed_feature = F.normalize(self.feature_projection(fixed.features), dim=-1)
         moving_feature = F.normalize(self.feature_projection(moving.features), dim=-1)
         feature_similarity = torch.einsum("bif,bjf->bij", fixed_feature, moving_feature)
-        if (
-            self.appearance_weight
-            or self.score_mode == "appearance_residual"
-        ):
+        if self.appearance_weight or self.score_mode in {
+            "appearance_residual",
+            "contextual_residual",
+        }:
             fixed_appearance = self._standardized_appearance(fixed)
             moving_appearance = self._standardized_appearance(moving)
             if fixed_appearance.shape[-1] != moving_appearance.shape[-1]:
@@ -248,24 +500,46 @@ class PartialSinkhornMatcher(nn.Module):
         feature_cost = 1.0 - feature_similarity
         appearance_cost = 1.0 - appearance_similarity
         feature_residual_score = torch.zeros_like(feature_similarity)
-        if self.score_mode == "appearance_residual":
+        context_attention_concentration = feature_similarity.new_zeros(())
+        if self.score_mode in {
+            "appearance_residual",
+            "contextual_residual",
+        }:
             if self.pair_residual_score is None:
                 raise AssertionError("pair residual scorer is missing")
-            appearance_delta = (
-                fixed_appearance[..., 0].unsqueeze(2)
-                - moving_appearance[..., 0].unsqueeze(1)
-            ).abs()
-            pair_metrics = torch.cat(
+            if self.score_mode == "contextual_residual":
                 (
-                    appearance_similarity.unsqueeze(-1),
-                    feature_similarity.unsqueeze(-1),
+                    pair_metrics,
+                    context_attention_concentration,
+                ) = self._contextual_pair_features(
+                    fixed,
+                    moving,
+                    appearance_similarity,
+                    feature_similarity,
                     center_delta,
-                    position_cost.sqrt().unsqueeze(-1),
-                    scale_cost.unsqueeze(-1),
-                    appearance_delta.unsqueeze(-1),
-                ),
-                dim=-1,
-            )
+                    position_cost,
+                    log_scale_delta,
+                    scale_cost,
+                    fixed_appearance,
+                    moving_appearance,
+                    candidate_mask,
+                )
+            else:
+                appearance_delta = (
+                    fixed_appearance[..., 0].unsqueeze(2)
+                    - moving_appearance[..., 0].unsqueeze(1)
+                ).abs()
+                pair_metrics = torch.cat(
+                    (
+                        appearance_similarity.unsqueeze(-1),
+                        feature_similarity.unsqueeze(-1),
+                        center_delta,
+                        position_cost.sqrt().unsqueeze(-1),
+                        scale_cost.unsqueeze(-1),
+                        appearance_delta.unsqueeze(-1),
+                    ),
+                    dim=-1,
+                )
             feature_residual_score = (
                 self.max_feature_residual_logit
                 * torch.tanh(
@@ -390,6 +664,9 @@ class PartialSinkhornMatcher(nn.Module):
             "cycle_error": cycle_error.mean(),
             "transport_cost": transport_cost,
             "mutual_concentration": selected_row_plan.max(dim=2).values.mean(),
+            "context_attention_concentration": (
+                context_attention_concentration
+            ),
             "feature_residual_score": feature_residual_score,
             "feature_residual_logit": (
                 self.feature_residual_weight * feature_residual_score
@@ -428,6 +705,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         feature_residual_weight: float = 0.0,
         max_feature_residual_logit: float = 2.0,
         pair_score_hidden_dim: int = 32,
+        pair_context_dim: Optional[int] = None,
+        pair_score_heads: int = 4,
+        pair_fusion_hidden_dim: Optional[int] = None,
+        pair_context_temperature: float = 0.20,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
@@ -457,6 +738,10 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     feature_residual_weight=feature_residual_weight,
                     max_feature_residual_logit=max_feature_residual_logit,
                     pair_score_hidden_dim=pair_score_hidden_dim,
+                    pair_context_dim=pair_context_dim,
+                    pair_score_heads=pair_score_heads,
+                    pair_fusion_hidden_dim=pair_fusion_hidden_dim,
+                    pair_context_temperature=pair_context_temperature,
                 )
                 for _ in range(3)
             ]

@@ -11,9 +11,11 @@ from typing import Dict, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256
+from gaussian_native.integration import ScalingAndSquaring, warp_tensor
 from experiment_utils import (
     atomic_torch_save,
     build_model,
@@ -160,12 +162,253 @@ def _augment_pair(
     return _augment_intensity(moving, config), _augment_intensity(fixed, config)
 
 
+def _synthetic_deformation_probability(
+    config: Mapping[str, object],
+    epoch: int,
+) -> float:
+    """Return the scheduled probability of a supervised synthetic pair."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    if not bool(config.get("enabled", False)):
+        return 0.0
+    warmup_epochs = int(config.get("warmup_epochs", 0))
+    active_until_epoch = int(
+        config.get("active_until_epoch", warmup_epochs)
+    )
+    probability = float(config.get("probability_after_warmup", 0.0))
+    if (
+        warmup_epochs < 0
+        or active_until_epoch < warmup_epochs
+        or not 0.0 <= probability <= 1.0
+    ):
+        raise ValueError("invalid synthetic deformation schedule")
+    if epoch <= warmup_epochs:
+        return 1.0
+    if epoch <= active_until_epoch:
+        return probability
+    return 0.0
+
+
+@torch.no_grad()
+def _make_synthetic_deformation_pair(
+    moving: torch.Tensor,
+    fixed: torch.Tensor,
+    spacing_dhw: torch.Tensor,
+    config: Mapping[str, object],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create an exact moving/fixed pair with a known diffeomorphic flow."""
+    if moving.shape != fixed.shape or moving.ndim != 5:
+        raise AssertionError("synthetic inputs must have matching 5D shapes")
+    coarse_shape = tuple(
+        int(value)
+        for value in config.get("control_grid_shape", (5, 6, 6))
+    )
+    if len(coarse_shape) != 3 or any(value < 2 for value in coarse_shape):
+        raise ValueError(
+            "synthetic control_grid_shape must contain three values >= 2"
+        )
+    local_low, local_high = (
+        float(value)
+        for value in config.get(
+            "local_velocity_mm_range",
+            (2.0, 8.0),
+        )
+    )
+    translation_low, translation_high = (
+        float(value)
+        for value in config.get(
+            "translation_velocity_mm_range",
+            (0.0, 5.0),
+        )
+    )
+    integration_steps = int(config.get("integration_steps", 7))
+    if (
+        local_low < 0.0
+        or local_high < local_low
+        or translation_low < 0.0
+        or translation_high < translation_low
+        or integration_steps <= 0
+    ):
+        raise ValueError("invalid synthetic deformation magnitude")
+
+    batch = int(moving.shape[0])
+    choose_fixed = (
+        torch.rand(
+            batch,
+            1,
+            1,
+            1,
+            1,
+            device=moving.device,
+        )
+        < 0.5
+    )
+    source = torch.where(choose_fixed, fixed, moving).float()
+    coarse = torch.randn(
+        batch,
+        3,
+        *coarse_shape,
+        device=moving.device,
+        dtype=torch.float32,
+    )
+    local = F.interpolate(
+        coarse,
+        size=moving.shape[2:],
+        mode="trilinear",
+        align_corners=True,
+    )
+    local = local - local.mean(dim=(2, 3, 4), keepdim=True)
+    maximum_norm = torch.linalg.vector_norm(
+        local,
+        dim=1,
+    ).flatten(1).amax(dim=1).clamp_min(1.0e-6)
+    local_magnitude = local_low + (
+        local_high - local_low
+    ) * torch.rand(batch, device=moving.device)
+    local = local * (
+        local_magnitude / maximum_norm
+    ).view(batch, 1, 1, 1, 1)
+
+    translation_direction = torch.randn(
+        batch,
+        3,
+        device=moving.device,
+        dtype=torch.float32,
+    )
+    translation_direction = translation_direction / torch.linalg.vector_norm(
+        translation_direction,
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1.0e-6)
+    translation_magnitude = translation_low + (
+        translation_high - translation_low
+    ) * torch.rand(batch, device=moving.device)
+    translation = (
+        translation_direction * translation_magnitude.unsqueeze(1)
+    ).view(batch, 3, 1, 1, 1)
+
+    velocity_mm = local + translation
+    spacing = spacing_dhw.to(
+        device=moving.device,
+        dtype=torch.float32,
+    ).reshape(1, 3, 1, 1, 1)
+    if spacing.numel() != 3 or float(spacing.min()) <= 0.0:
+        raise ValueError("spacing_dhw must contain three positive values")
+    velocity_vox = velocity_mm / spacing
+    target_flow = ScalingAndSquaring(
+        steps=integration_steps
+    )(velocity_vox)
+    synthetic_fixed = warp_tensor(
+        source,
+        target_flow,
+        padding_mode="zeros",
+    )
+    return source, synthetic_fixed, target_flow
+
+
+def _sample_flow_mm_at_centers(
+    flow_vox: torch.Tensor,
+    spacing_dhw: torch.Tensor,
+    centers_mm: torch.Tensor,
+    extent_mm: torch.Tensor,
+) -> torch.Tensor:
+    """Sample a dense DHW flow at physical Gaussian centres."""
+    spacing = spacing_dhw.to(
+        device=flow_vox.device,
+        dtype=flow_vox.dtype,
+    ).reshape(1, 3, 1, 1, 1)
+    flow_mm = flow_vox.float() * spacing.float()
+    normalized_dhw = (
+        2.0
+        * centers_mm.float()
+        / extent_mm.float().unsqueeze(1).clamp_min(1.0e-6)
+        - 1.0
+    )
+    sampling_whd = normalized_dhw[..., [2, 1, 0]].reshape(
+        centers_mm.shape[0],
+        centers_mm.shape[1],
+        1,
+        1,
+        3,
+    )
+    sampled = F.grid_sample(
+        flow_mm,
+        sampling_whd,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return sampled[:, :, :, 0, 0].transpose(1, 2)
+
+
+def _synthetic_supervision(
+    output: Mapping[str, object],
+    target_flow: torch.Tensor,
+    spacing_dhw: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Supervise both the dense flow and Gaussian transport displacement."""
+    prediction = output["flow"].float()
+    target = target_flow.float()
+    normalization = torch.linalg.vector_norm(
+        target,
+        dim=1,
+    ).flatten(1).amax(dim=1).clamp_min(1.0).view(-1, 1, 1, 1, 1)
+    flow_loss = F.smooth_l1_loss(
+        prediction / normalization,
+        target / normalization,
+        beta=0.10,
+    )
+
+    extent_mm = output["fixed_decomposition"]["extent_mm"]
+    node_losses = []
+    for level, match in zip(
+        output["fixed_decomposition"]["levels"],
+        output["correspondence"],
+    ):
+        centers = (
+            level.anchor_centers_mm
+            if level.anchor_centers_mm is not None
+            else level.centers_mm
+        )
+        target_delta = _sample_flow_mm_at_centers(
+            target,
+            spacing_dhw,
+            centers,
+            extent_mm,
+        )
+        level_scale = torch.linalg.vector_norm(
+            target_delta,
+            dim=-1,
+        ).amax(dim=1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
+        node_losses.append(
+            F.smooth_l1_loss(
+                match["transport_delta_mm"].float() / level_scale,
+                target_delta / level_scale,
+                beta=0.10,
+            )
+        )
+    correspondence_loss = sum(node_losses) / float(len(node_losses))
+    spacing = spacing_dhw.to(
+        device=target.device,
+        dtype=target.dtype,
+    ).reshape(1, 3, 1, 1, 1)
+    endpoint_error_mm = torch.linalg.vector_norm(
+        (prediction - target) * spacing,
+        dim=1,
+    ).mean()
+    return {
+        "synthetic_flow": flow_loss,
+        "synthetic_correspondence": correspondence_loss,
+        "synthetic_endpoint_error_mm": endpoint_error_mm,
+    }
+
+
 def _configure_training_stage(
     model: torch.nn.Module,
     config: Mapping[str, object],
     epoch: int,
 ) -> Dict[str, object]:
-    """Apply the correspondence-first curriculum used by production v8."""
+    """Apply the configured correspondence or synthetic curriculum."""
     if epoch <= 0:
         raise ValueError("epoch must be positive")
     optimization = dict(config.get("optimization", {}))
@@ -191,13 +434,22 @@ def _configure_training_stage(
     if velocity_head is not None:
         for parameter in velocity_head.parameters():
             parameter.requires_grad_(not correspondence_warmup)
+    synthetic_probability = _synthetic_deformation_probability(
+        dict(config.get("synthetic_deformation", {})),
+        epoch,
+    )
+    if correspondence_warmup:
+        stage_name = "correspondence_warmup"
+    elif synthetic_probability >= 1.0:
+        stage_name = "synthetic_deformation_warmup"
+    elif synthetic_probability > 0.0:
+        stage_name = "joint_with_synthetic_deformation"
+    else:
+        stage_name = "joint"
     return {
-        "name": (
-            "correspondence_warmup"
-            if correspondence_warmup
-            else "joint"
-        ),
+        "name": stage_name,
         "velocity_head_trainable": not correspondence_warmup,
+        "synthetic_deformation_probability": synthetic_probability,
         "trainable_parameters": sum(
             parameter.numel()
             for parameter in model.parameters()
@@ -217,6 +469,8 @@ def _train_epoch(
     amp_dtype: str,
     amp_cache_enabled: bool,
     augmentation: Mapping[str, object],
+    synthetic_deformation: Mapping[str, object],
+    synthetic_probability: float,
     gradient_clip: float,
     epoch: int,
     log_every: int,
@@ -224,13 +478,49 @@ def _train_epoch(
     model.train()
     totals = defaultdict(float)
     sample_count = 0
+    synthetic_sample_count = 0
     successful_steps = 0
     first_step_pair_gradient_l1 = None
+    synthetic_flow_weight = float(
+        synthetic_deformation.get("flow_loss_weight", 0.0)
+    )
+    synthetic_correspondence_weight = float(
+        synthetic_deformation.get(
+            "correspondence_loss_weight",
+            0.0,
+        )
+    )
+    if (
+        not 0.0 <= synthetic_probability <= 1.0
+        or synthetic_flow_weight < 0.0
+        or synthetic_correspondence_weight < 0.0
+    ):
+        raise ValueError("invalid synthetic training probability or weights")
+    spacing_dhw = getattr(model, "spacing_dhw", None)
+    if synthetic_probability > 0.0 and spacing_dhw is None:
+        raise ValueError(
+            "synthetic deformation training requires model.spacing_dhw"
+        )
     start = time.perf_counter()
     for step, sample in enumerate(loader, start=1):
         moving = sample["moving"].to(device, non_blocking=True)
         fixed = sample["fixed"].to(device, non_blocking=True)
         moving, fixed = _augment_pair(moving, fixed, augmentation)
+        target_flow = None
+        if (
+            synthetic_probability > 0.0
+            and float(torch.rand((), device=device))
+            < synthetic_probability
+        ):
+            moving, fixed, target_flow = (
+                _make_synthetic_deformation_pair(
+                    moving,
+                    fixed,
+                    spacing_dhw,
+                    synthetic_deformation,
+                )
+            )
+            synthetic_sample_count += int(moving.shape[0])
         optimizer.zero_grad(set_to_none=True)
         with cuda_autocast(
             amp,
@@ -239,6 +529,30 @@ def _train_epoch(
         ):
             output = model(moving, fixed, return_aux=True)
             terms = objective(output, moving, fixed)
+            terms = dict(terms)
+            zero = output["flow"].new_zeros((), dtype=torch.float32)
+            if target_flow is None:
+                synthetic_terms = {
+                    "synthetic_flow": zero,
+                    "synthetic_correspondence": zero,
+                    "synthetic_endpoint_error_mm": zero,
+                }
+                synthetic_fraction = zero
+            else:
+                synthetic_terms = _synthetic_supervision(
+                    output,
+                    target_flow,
+                    spacing_dhw,
+                )
+                synthetic_fraction = zero + 1.0
+            terms.update(synthetic_terms)
+            terms["synthetic_fraction"] = synthetic_fraction
+            terms["total"] = (
+                terms["total"]
+                + synthetic_flow_weight * terms["synthetic_flow"]
+                + synthetic_correspondence_weight
+                * terms["synthetic_correspondence"]
+            )
         if not bool(torch.isfinite(terms["total"]).detach()):
             raise FloatingPointError("non-finite loss for patients %s" % list(sample["patient_id"]))
         scaler.scale(terms["total"]).backward()
@@ -337,6 +651,16 @@ def _train_epoch(
     if successful_steps == 0:
         raise FloatingPointError("all optimizer steps in the epoch were skipped")
     result = {name: value / max(sample_count, 1) for name, value in totals.items()}
+    for name in (
+        "synthetic_flow",
+        "synthetic_correspondence",
+        "synthetic_endpoint_error_mm",
+    ):
+        if synthetic_sample_count:
+            result[name] = totals[name] / synthetic_sample_count
+    result["synthetic_fraction"] = (
+        float(synthetic_sample_count) / float(max(sample_count, 1))
+    )
     if first_step_pair_gradient_l1 is not None:
         result["pair_residual_gradient_l1_first_step"] = (
             first_step_pair_gradient_l1
@@ -703,6 +1027,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     device = resolve_device(args.device)
     optimization = dict(config.get("optimization", {}))
     augmentation = dict(config.get("augmentation", {}))
+    synthetic_deformation = dict(
+        config.get("synthetic_deformation", {})
+    )
     data_config = dict(config.get("data", {}))
     shape = tuple(int(value) for value in data_config.get("shape_dhw", (128, 160, 160)))
     train_dataset = HeadNeckRegistrationDataset(
@@ -890,6 +1217,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 amp_dtype,
                 amp_cache_enabled,
                 augmentation,
+                synthetic_deformation,
+                float(
+                    training_stage[
+                        "synthetic_deformation_probability"
+                    ]
+                ),
                 gradient_clip,
                 epoch,
                 log_every,
@@ -911,6 +1244,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             )
             train_metrics["trainable_parameters_epoch"] = float(
                 training_stage["trainable_parameters"]
+            )
+            train_metrics["synthetic_deformation_probability"] = float(
+                training_stage["synthetic_deformation_probability"]
             )
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:

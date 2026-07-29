@@ -142,16 +142,29 @@ The residual multiplier \(\lambda_r\) follows the configured training ramp
 remain close to the deterministic base matcher, and learned features can
 refine it while the base term remains present.
 
-Production v7/v8 apply row-softmax on the admissible support. Fine-level support
+Production v9 replaces the eight-value MLP with a bidirectional contextual
+matcher. Separate multi-head query/key projections produce an initial
+fixed-to-moving affinity. Row- and column-normalized attention then aggregate
+moving context for every fixed Gaussian and fixed context for every moving
+Gaussian. A shared fusion network combines each node with its transported
+context. Refined multi-head similarities are concatenated with the initial
+similarities, appearance correlation, signed position, distance, per-axis
+log-scale difference, scale cost, appearance difference, and log-mass
+difference. A zero-initialized bounded output layer still makes the initial
+transport equal to the fixed base matcher. This changes the learned matching
+capacity from 963 pair-MLP parameters in v8 to a 1,639,206-parameter
+correspondence subsystem in v9.
+
+Production v7--v9 apply row-softmax on the admissible support. Fine-level support
 contains only the strongest transported parents; the same-index parent is not
 inserted unconditionally. Forbidden entries are explicitly zeroed and
 renormalized, so sparse support cannot be undone by a marginal constraint.
 Fixed-to-moving and fixed-to-fixed calibration use the exact same support.
 Sinkhorn, dustbin, and mutual transport remain implementation ablations but
-are not in v7/v8.
+are not in v7--v9.
 
 The transport yields matched moving features, centers, scales, and covariances
-for every fixed Gaussian. Expected transport cost is not optimized in v7/v8
+for every fixed Gaussian. Expected transport cost is not optimized in v7--v9
 because it admits uniform or feature-collapse shortcuts; registration
 similarity supplies the task gradient through the learned portion of the
 matching score.
@@ -179,7 +192,7 @@ while identical inputs have exactly zero calibrated transport displacement.
 
 ### 4.2 Anatomy-calibrated residual motion hierarchy
 
-Revisions v7/v8 compute fixed-base, residual-refined fixed-to-moving
+Revisions v7--v9 compute fixed-base, residual-refined fixed-to-moving
 correspondence in the canonical Gaussian frame. Its direct displacement is:
 
 \[
@@ -189,12 +202,12 @@ correspondence in the canonical Gaussian frame. Its direct displacement is:
 \]
 
 The stopped fixed-to-fixed reference removes soft-correspondence barycentre
-bias and keeps identical-input direct displacement exactly zero. Since the v7/v8
+bias and keeps identical-input direct displacement exactly zero. Since the v7--v9
 geometry is shared and canonical, motion comes from differences between the
 cross-image and self-image transport distributions, not from predicted centre
 drift. Mutual row/column plan multiplication is not used.
 
-There is no geometry predictor in v7/v8, so matching costs cannot be lowered by
+There is no geometry predictor in v7--v9, so matching costs cannot be lowered by
 moving the primitives. A low position weight is only a soft anatomical
 locality prior, and the matching temperature is cosine-annealed from 0.12 to
 0.08.
@@ -275,11 +288,11 @@ The objective has four reported groups:
    - scale-space reconstruction;
    - Gaussian coverage;
    - parent/child containment;
-   - reported for diagnostics, with production v7/v8 group weight zero because
+   - reported for diagnostics, with production v7--v9 group weight zero because
      geometry is fixed.
 3. **Correspondence**
    - reported expected transport cost, cycle error, and hierarchy consistency;
-   - production v7/v8 group weight is zero to avoid the self-minimizing
+   - production v7--v9 group weight is zero to avoid the self-minimizing
      correspondence shortcut.
 4. **Deformation**
    - SVF derivative energy;
@@ -290,7 +303,7 @@ The objective has four reported groups:
 Labels are never loaded by the training dataset. Validation and test labels are
 used only for response-aware Dice, HD95, and ASSD.
 
-Production v8 uses a correspondence-first curriculum. During epochs 1--5, the
+Production v8 used a correspondence-first curriculum. During epochs 1--5, the
 learned velocity-head parameters are frozen while differentiable direct
 Gaussian transport keeps the image-similarity gradient connected to the
 encoder and residual pair scorer. From epoch 6 onward, the velocity head is
@@ -298,19 +311,41 @@ unfrozen and the complete model is optimized jointly. LR warmup uses the same
 five-epoch boundary. This is a training strategy rather than an additional
 prediction module.
 
+Production v9 instead uses a supervised synthetic-deformation curriculum
+without anatomical labels. A coarse random stationary velocity \(u\), expressed
+in millimetres, is trilinearly interpolated, bounded, augmented with a random
+translation, and integrated as \(\phi=\exp(u)\). For an observed training image
+\(I\), the exact synthetic pair is
+
+\[
+I^M=I,\qquad I^F=I\circ\phi.
+\]
+
+The predicted dense sampling flow is supervised against \(\phi\), and each
+level's calibrated Gaussian transport displacement is supervised against
+\(\phi\) sampled at its canonical centres. Both use normalized Smooth-L1
+losses. Epochs 1--8 use synthetic pairs exclusively; epochs 9--60 sample them
+with probability 0.25 and otherwise use the real longitudinal pair. The
+velocity head remains trainable because the dense target supervises the whole
+representation--matching--motion chain. This curriculum teaches sensitivity to
+known non-identity anatomy while allowing correct same-index correspondence
+after affine prealignment.
+
 ## 6. Production configuration
 
 - Input: `128×160×160`, 1.5 mm isotropic.
 - Gaussian counts: `64/256/1024`.
-- Feature width: 128.
-- Graph encoder: three blocks per level, eight heads, 16 neighbours.
+- Feature width: 160.
+- Graph encoder: three blocks per level, eight heads, 20 neighbours.
 - Production geometry: anchored centres/scales, identity rotations, uniform
   mass; no learned geometry predictor.
 - Production transport: strict-support row-softmax.
-- Fixed appearance base weight: 1.0 throughout training.
-- Learned residual multiplier: cosine 0.35 to 1.0 over 20 epochs.
-- Maximum learned residual logit before the multiplier: 2.0.
-- Matching temperature: cosine 0.12 to 0.07 over 40 epochs.
+- Contextual pair scorer: eight heads, 256 context channels, 320 fusion
+  channels, and 160 pair-score hidden channels.
+- Fixed appearance base weight: cosine 0.85 to 0.45 over 40 epochs.
+- Learned residual multiplier: cosine 0.15 to 1.0 over 30 epochs.
+- Maximum learned residual logit before the multiplier: 2.5.
+- Matching temperature: cosine 0.15 to 0.08 over 50 epochs.
 - Position weight: 0.03.
 - Production dustbin mass: 0.
 - Production motion: translation-only local Gaussian residuals.
@@ -318,9 +353,12 @@ prediction module.
 - Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
 - Integration steps: 7.
-- Trainable parameters: 1,906,522.
+- Trainable parameters: 4,511,642.
+- Correspondence parameters: 1,639,206.
 - Training autocast: bfloat16.
-- Correspondence-first/learning-rate warmup: 5 epochs.
+- Synthetic-deformation warmup: 8 epochs; 25% synthetic sampling through
+  epoch 60.
+- Learning-rate warmup: 5 epochs.
 - AMP weight cache: disabled to preserve gradients across no-gradient
   fixed-to-fixed calibration and trainable fixed-to-moving matching.
 - Geometry, transport, rasterization, integration, and NCC: float32.
