@@ -234,6 +234,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v5",
         "gaussian_native_v6",
         "gaussian_native_v7",
+        "gaussian_native_v8",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",

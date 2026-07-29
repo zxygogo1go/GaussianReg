@@ -21,6 +21,7 @@ from model import SACB_Net
 from train_registration import (
     _augment_pair,
     _collapse_warning,
+    _configure_training_stage,
     _fail_fast_reason,
 )
 
@@ -273,6 +274,69 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(
             model.correspondence.feature_residual_weight,
             1.0,
+        )
+
+    def test_v8_correspondence_warmup_freezes_only_velocity_head(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v8",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "appearance_residual",
+                "appearance_weight": 1.0,
+                "feature_residual_weight": 0.35,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "motion_mode": "translation",
+            },
+            "optimization": {
+                "correspondence_warmup_epochs": 2,
+                "freeze_velocity_head_during_correspondence_warmup": True,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v8")
+        self.assertEqual(model.decomposer.geometry_mode, "anchored")
+        warmup = _configure_training_stage(model, config, 1)
+        self.assertEqual(warmup["name"], "correspondence_warmup")
+        self.assertFalse(warmup["velocity_head_trainable"])
+        self.assertFalse(
+            any(
+                parameter.requires_grad
+                for parameter in model.velocity_head.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.correspondence.parameters()
+            )
+        )
+        joint = _configure_training_stage(model, config, 3)
+        self.assertEqual(joint["name"], "joint")
+        self.assertTrue(joint["velocity_head_trainable"])
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.velocity_head.parameters()
+            )
         )
 
     def test_correspondence_temperature_schedule_boundaries(self):

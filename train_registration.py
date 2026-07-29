@@ -160,6 +160,52 @@ def _augment_pair(
     return _augment_intensity(moving, config), _augment_intensity(fixed, config)
 
 
+def _configure_training_stage(
+    model: torch.nn.Module,
+    config: Mapping[str, object],
+    epoch: int,
+) -> Dict[str, object]:
+    """Apply the correspondence-first curriculum used by production v8."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    optimization = dict(config.get("optimization", {}))
+    warmup_epochs = int(
+        optimization.get("correspondence_warmup_epochs", 0)
+    )
+    if warmup_epochs < 0:
+        raise ValueError(
+            "optimization.correspondence_warmup_epochs must be nonnegative"
+        )
+    freeze_velocity = bool(
+        optimization.get(
+            "freeze_velocity_head_during_correspondence_warmup",
+            True,
+        )
+    )
+    velocity_head = getattr(model, "velocity_head", None)
+    correspondence_warmup = bool(
+        velocity_head is not None
+        and freeze_velocity
+        and epoch <= warmup_epochs
+    )
+    if velocity_head is not None:
+        for parameter in velocity_head.parameters():
+            parameter.requires_grad_(not correspondence_warmup)
+    return {
+        "name": (
+            "correspondence_warmup"
+            if correspondence_warmup
+            else "joint"
+        ),
+        "velocity_head_trainable": not correspondence_warmup,
+        "trainable_parameters": sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
+    }
+
+
 def _train_epoch(
     model: torch.nn.Module,
     objective: torch.nn.Module,
@@ -812,6 +858,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
         raise ValueError("validation/checkpoint/log intervals and gradient_clip must be positive")
     try:
         for epoch in range(start_epoch, epochs + 1):
+            training_stage = _configure_training_stage(
+                model,
+                config,
+                epoch,
+            )
             match_temperature = configure_model_for_epoch(
                 model,
                 config,
@@ -855,6 +906,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 train_metrics[
                     "correspondence_feature_residual_weight"
                 ] = float(match_feature_residual_weight)
+            train_metrics["velocity_head_trainable"] = float(
+                bool(training_stage["velocity_head_trainable"])
+            )
+            train_metrics["trainable_parameters_epoch"] = float(
+                training_stage["trainable_parameters"]
+            )
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:
                 validation_metrics = _validate(
@@ -875,6 +932,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             scheduler.step()
             record = {
                 "epoch": epoch,
+                "training_stage": training_stage["name"],
                 "learning_rate": lr,
                 "train": train_metrics,
                 "validation": validation_metrics,
@@ -885,6 +943,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             for name, value in validation_metrics.items():
                 writer.add_scalar("validation/" + name, value, epoch)
             writer.add_scalar("optimization/learning_rate", lr, epoch)
+            writer.add_scalar(
+                "optimization/velocity_head_trainable",
+                float(bool(training_stage["velocity_head_trainable"])),
+                epoch,
+            )
 
             score = float(validation_metrics.get("ncc_after", -float("inf")))
             ncc_gain = float(
@@ -950,7 +1013,8 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 validation_metrics.get("p95_displacement_mm", float("nan"))
             )
             print(
-                "epoch %d complete lr=%.3e match_temp=%s appearance=%s "
+                "epoch %d complete stage=%s lr=%.3e "
+                "match_temp=%s appearance=%s "
                 "feature_residual=%s val_ncc=%s "
                 "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
                 "raw_e=%.4f/%.4f/%.4f motion_e=%.4f/%.4f/%.4f "
@@ -959,6 +1023,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 "fold=%.6f best=%.5f"
                 % (
                     epoch,
+                    training_stage["name"],
                     lr,
                     "%.4f" % match_temperature
                     if match_temperature is not None

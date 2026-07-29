@@ -85,6 +85,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
+            "gaussian_native_v8",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -94,6 +95,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
+            "gaussian_native_v8",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -101,6 +103,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
+            "gaussian_native_v8",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -108,14 +111,19 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
+            "gaussian_native_v8",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
             "gaussian_native_v6",
             "gaussian_native_v7",
+            "gaussian_native_v8",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
-        use_v7_motion = self.architecture_revision == "gaussian_native_v7"
+        use_residual_pair_motion = self.architecture_revision in {
+            "gaussian_native_v7",
+            "gaussian_native_v8",
+        }
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
         rotation_limit = (
@@ -152,7 +160,9 @@ class GaussianNativeRegistration(nn.Module):
             samples_per_axis=samples_per_axis,
             raster_chunk=raster_chunk,
             covariance_mode=covariance_mode,
-            geometry_mode=geometry_mode if use_v7_motion else "adaptive",
+            geometry_mode=(
+                geometry_mode if use_residual_pair_motion else "adaptive"
+            ),
         )
         self.encoder = HierarchicalGaussianEncoder(
             feature_dim=feature_dim,
@@ -176,7 +186,7 @@ class GaussianNativeRegistration(nn.Module):
             # barycentre bias while preserving moving-to-fixed centre drift.
             coordinate_mode=(
                 "canonical"
-                if use_v3_motion or use_v7_motion
+                if use_v3_motion or use_residual_pair_motion
                 else "learned"
             ),
             mutual_transport=use_v3_motion,
@@ -195,11 +205,13 @@ class GaussianNativeRegistration(nn.Module):
             ),
             score_mode=(
                 correspondence_score_mode
-                if use_v7_motion
+                if use_residual_pair_motion
                 else "convex"
             ),
             feature_residual_weight=(
-                feature_residual_weight if use_v7_motion else 0.0
+                feature_residual_weight
+                if use_residual_pair_motion
+                else 0.0
             ),
             max_feature_residual_logit=max_feature_residual_logit,
             pair_score_hidden_dim=pair_score_hidden_dim,

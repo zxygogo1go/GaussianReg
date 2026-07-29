@@ -52,7 +52,7 @@ The implementation supports a learned covariance parameterization:
 where \(R\) is produced by the continuous 6D rotation representation and
 scales are strictly positive.
 
-Production v7 instead fixes centres, axis scales, identity rotations, and
+Production v7/v8 instead fixes centres, axis scales, identity rotations, and
 uniform mass to a canonical hierarchy. This removes image-dependent geometric
 degrees of freedom from the production matcher while retaining explicit SPD
 covariance tensors and Gaussian feature/appearance measurements.
@@ -79,7 +79,7 @@ No trainable voxel convolution is used.
 - Each middle primitive produces four children: `1024` primitives.
 
 Children use fixed tetrahedral offsets inside each canonical parent. In
-production v7, local Gaussian-window measurements change the appearance and
+production v7/v8, local Gaussian-window measurements change the appearance and
 learned feature of a primitive but cannot move or resize it. The earlier
 anatomy-adaptive geometry predictor remains only for revision ablations.
 
@@ -93,7 +93,7 @@ Mass is exactly conserved:
 Because production geometry is fixed, centre/scale/mass collapse is impossible
 by construction. Reconstruction, coverage, and parent containment remain
 reported representation diagnostics for historical ablations but have zero
-group weight in the v7 training objective.
+group weight in the v7/v8 training objective.
 
 ### 3.4 Gaussian graph encoder
 
@@ -112,7 +112,7 @@ Parent features are explicitly propagated into the child level.
 The root level performs global all-to-all transport. For each finer level, the
 top parent transports define the admissible child correspondence mask.
 
-Production revision v7 uses a fixed appearance/geometric base and a bounded
+Production revisions v7/v8 use a fixed appearance/geometric base and a bounded
 learned residual. The appearance descriptor is the detached Gaussian-window
 intensity/derivative vector, standardized independently in each volume and
 L2-normalized. For pair \((i,j)\), the base cost is:
@@ -137,20 +137,21 @@ r_{ij}=r_{\max}\tanh f_\theta(x_{ij}),\qquad
 \]
 
 The final layer of \(f_\theta\) is initialized to zero and \(r_{\max}=2\).
-The residual multiplier \(\lambda_r\) is cosine-ramped from 0.1 to 1.0 over
-40 epochs. Therefore v7 initially reproduces the deterministic base matcher,
-and learned features can refine it while the base term remains present.
+The residual multiplier \(\lambda_r\) follows the configured training ramp
+(0.35 to 1.0 over 20 epochs in v8). Therefore v7/v8 initially reproduce or
+remain close to the deterministic base matcher, and learned features can
+refine it while the base term remains present.
 
-Production v7 applies row-softmax on the admissible support. Fine-level support
+Production v7/v8 apply row-softmax on the admissible support. Fine-level support
 contains only the strongest transported parents; the same-index parent is not
 inserted unconditionally. Forbidden entries are explicitly zeroed and
 renormalized, so sparse support cannot be undone by a marginal constraint.
 Fixed-to-moving and fixed-to-fixed calibration use the exact same support.
 Sinkhorn, dustbin, and mutual transport remain implementation ablations but
-are not in v7.
+are not in v7/v8.
 
 The transport yields matched moving features, centers, scales, and covariances
-for every fixed Gaussian. Expected transport cost is not optimized in v7
+for every fixed Gaussian. Expected transport cost is not optimized in v7/v8
 because it admits uniform or feature-collapse shortcuts; registration
 similarity supplies the task gradient through the learned portion of the
 matching score.
@@ -178,7 +179,7 @@ while identical inputs have exactly zero calibrated transport displacement.
 
 ### 4.2 Anatomy-calibrated residual motion hierarchy
 
-Revision v7 computes fixed-base, residual-refined fixed-to-moving
+Revisions v7/v8 compute fixed-base, residual-refined fixed-to-moving
 correspondence in the canonical Gaussian frame. Its direct displacement is:
 
 \[
@@ -188,12 +189,12 @@ correspondence in the canonical Gaussian frame. Its direct displacement is:
 \]
 
 The stopped fixed-to-fixed reference removes soft-correspondence barycentre
-bias and keeps identical-input direct displacement exactly zero. Since the v7
+bias and keeps identical-input direct displacement exactly zero. Since the v7/v8
 geometry is shared and canonical, motion comes from differences between the
 cross-image and self-image transport distributions, not from predicted centre
 drift. Mutual row/column plan multiplication is not used.
 
-There is no geometry predictor in v7, so matching costs cannot be lowered by
+There is no geometry predictor in v7/v8, so matching costs cannot be lowered by
 moving the primitives. A low position weight is only a soft anatomical
 locality prior, and the matching temperature is cosine-annealed from 0.12 to
 0.08.
@@ -274,11 +275,11 @@ The objective has four reported groups:
    - scale-space reconstruction;
    - Gaussian coverage;
    - parent/child containment;
-   - reported for diagnostics, with production v7 group weight zero because
+   - reported for diagnostics, with production v7/v8 group weight zero because
      geometry is fixed.
 3. **Correspondence**
    - reported expected transport cost, cycle error, and hierarchy consistency;
-   - production v7 group weight is zero to avoid the self-minimizing
+   - production v7/v8 group weight is zero to avoid the self-minimizing
      correspondence shortcut.
 4. **Deformation**
    - SVF derivative energy;
@@ -288,6 +289,14 @@ The objective has four reported groups:
 
 Labels are never loaded by the training dataset. Validation and test labels are
 used only for response-aware Dice, HD95, and ASSD.
+
+Production v8 uses a correspondence-first curriculum. During epochs 1--5, the
+learned velocity-head parameters are frozen while differentiable direct
+Gaussian transport keeps the image-similarity gradient connected to the
+encoder and residual pair scorer. From epoch 6 onward, the velocity head is
+unfrozen and the complete model is optimized jointly. LR warmup uses the same
+five-epoch boundary. This is a training strategy rather than an additional
+prediction module.
 
 ## 6. Production configuration
 
@@ -299,18 +308,19 @@ used only for response-aware Dice, HD95, and ASSD.
   mass; no learned geometry predictor.
 - Production transport: strict-support row-softmax.
 - Fixed appearance base weight: 1.0 throughout training.
-- Learned residual multiplier: cosine 0.1 to 1.0 over 40 epochs.
+- Learned residual multiplier: cosine 0.35 to 1.0 over 20 epochs.
 - Maximum learned residual logit before the multiplier: 2.0.
-- Matching temperature: cosine 0.12 to 0.08 over 60 epochs.
+- Matching temperature: cosine 0.12 to 0.07 over 40 epochs.
 - Position weight: 0.03.
 - Production dustbin mass: 0.
 - Production motion: translation-only local Gaussian residuals.
-- Direct residual fractions: 0.75/1.0/1.0 for root/middle/fine levels.
+- Direct residual fractions: 0.55/0.85/0.75 for root/middle/fine levels.
 - Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
 - Integration steps: 7.
 - Trainable parameters: 1,906,522.
 - Training autocast: bfloat16.
+- Correspondence-first/learning-rate warmup: 5 epochs.
 - AMP weight cache: disabled to preserve gradients across no-gradient
   fixed-to-fixed calibration and trainable fixed-to-moving matching.
 - Geometry, transport, rasterization, integration, and NCC: float32.
