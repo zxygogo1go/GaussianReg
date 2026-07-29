@@ -236,6 +236,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v7",
         "gaussian_native_v8",
         "gaussian_native_v9",
+        "gaussian_native_v10",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -299,6 +300,30 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         ),
         pair_context_temperature=float(
             model.get("pair_context_temperature", 0.20)
+        ),
+        refinement_factors=tuple(
+            int(value)
+            for value in model.get(
+                "refinement_factors",
+                (8, 4, 2),
+            )
+        ),
+        refinement_channels=tuple(
+            int(value)
+            for value in model.get(
+                "refinement_channels",
+                (48, 40, 32),
+            )
+        ),
+        refinement_blocks_per_stage=int(
+            model.get("refinement_blocks_per_stage", 3)
+        ),
+        refinement_maximum_residual_vox=tuple(
+            float(value)
+            for value in model.get(
+                "refinement_maximum_residual_vox",
+                (1.5, 1.0, 0.75),
+            )
         ),
         include_identity_candidate=(
             None
@@ -534,6 +559,18 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
     for index, field in enumerate(output.get("level_velocity_mm", ())):
         diagnostics["level_velocity_l%d_abs_mm" % index] = float(
             field.detach().float().abs().mean().cpu()
+        )
+    for index, residual in enumerate(
+        output.get("pyramid_residual_velocity_vox", ())
+    ):
+        diagnostics[
+            "pyramid_residual_l%d_abs_vox" % index
+        ] = float(
+            residual.detach().float().abs().mean().cpu()
+        )
+    for index, flow in enumerate(output.get("pyramid_flow", ())):
+        diagnostics["pyramid_flow_l%d_abs_vox" % index] = float(
+            flow.detach().float().abs().mean().cpu()
         )
     fixed_levels = output.get("fixed_decomposition", {}).get("levels", ())
     for index, level in enumerate(fixed_levels):

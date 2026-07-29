@@ -19,6 +19,8 @@ from experiment_utils import (
 )
 from train_registration import (
     _make_synthetic_deformation_pair,
+    _supervised_anatomy_factor,
+    _supervised_anatomy_loss,
     _synthetic_supervision,
 )
 
@@ -27,7 +29,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v9_hntsmrg24.json",
+        default="configs/gaussian_native_v10_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -66,6 +68,55 @@ def main() -> None:
             model.spacing_dhw,
             synthetic_config,
         )
+    supervised_config = dict(
+        config.get("supervised_anatomy", {})
+    )
+    moving_seg = None
+    fixed_seg = None
+    response_valid = None
+    if bool(supervised_config.get("enabled", False)):
+        moving_seg = torch.zeros(
+            (1, 1, *shape),
+            device=device,
+            dtype=torch.long,
+        )
+        fixed_seg = torch.zeros_like(moving_seg)
+        d0, h0, w0 = (value // 3 for value in shape)
+        d1, h1, w1 = (2 * value // 3 for value in shape)
+        moving_seg[
+            :,
+            :,
+            d0:d1,
+            h0:h1,
+            w0:w1,
+        ] = 1
+        fixed_seg[
+            :,
+            :,
+            d0 + 1:d1 + 1,
+            h0:h1,
+            w0:w1,
+        ] = 1
+        moving_seg[
+            :,
+            :,
+            d0:d1,
+            h0 // 2:h0,
+            w0 // 2:w0,
+        ] = 2
+        fixed_seg[
+            :,
+            :,
+            d0:d1,
+            h0 // 2 + 1:h0 + 1,
+            w0 // 2:w0,
+        ] = 2
+        response_valid = torch.ones(
+            1,
+            2,
+            device=device,
+            dtype=torch.bool,
+        )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -101,6 +152,39 @@ def main() -> None:
                     )
                 )
                 * terms["synthetic_correspondence"]
+            )
+        if moving_seg is not None:
+            supervised_terms = _supervised_anatomy_loss(
+                output,
+                moving_seg,
+                fixed_seg,
+                response_valid,
+                supervised_config,
+            )
+            terms.update(supervised_terms)
+            factor = _supervised_anatomy_factor(
+                supervised_config,
+                epoch=1,
+            )
+            terms["total"] = (
+                terms["total"]
+                + factor
+                * (
+                    float(
+                        supervised_config.get(
+                            "dice_loss_weight",
+                            0.0,
+                        )
+                    )
+                    * terms["supervised_dice"]
+                    + float(
+                        supervised_config.get(
+                            "boundary_loss_weight",
+                            0.0,
+                        )
+                    )
+                    * terms["supervised_boundary"]
+                )
             )
     terms["total"].backward()
     if device.type == "cuda":
@@ -173,6 +257,8 @@ def main() -> None:
                     "transport_delta_",
                     "direct_translation_",
                     "learned_translation_",
+                    "pyramid_residual_",
+                    "pyramid_flow_",
                 )
             )
         },

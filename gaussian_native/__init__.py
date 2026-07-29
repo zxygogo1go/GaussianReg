@@ -1,8 +1,8 @@
 """Gaussian-native diffeomorphic registration.
 
-The package deliberately keeps every learned representation and deformation
-degree of freedom on Gaussian primitives. Dense tensors are used only to
-measure the input volumes and to rasterize/integrate the final velocity.
+Revisions through v9 keep learned correspondence and deformation on Gaussian
+primitives. V10 adds an explicit image-pyramid residual SVF refiner after the
+Gaussian coarse prior.
 """
 
 from .model import GaussianNativeRegistration

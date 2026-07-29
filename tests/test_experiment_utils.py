@@ -25,6 +25,8 @@ from train_registration import (
     _fail_fast_reason,
     _make_synthetic_deformation_pair,
     _sample_flow_mm_at_centers,
+    _supervised_anatomy_factor,
+    _supervised_anatomy_loss,
     _synthetic_deformation_probability,
 )
 
@@ -476,6 +478,105 @@ class ExperimentUtilityTests(unittest.TestCase):
             [[[3.0, 0.0, 0.0], [3.0, 0.0, 0.0]]]
         )
         self.assertTrue(torch.allclose(sampled, expected))
+
+    def test_v10_builder_enables_true_residual_pyramid(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v10",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "contextual_residual",
+                "appearance_weight": 0.8,
+                "feature_residual_weight": 0.1,
+                "pair_score_hidden_dim": 32,
+                "pair_context_dim": 32,
+                "pair_score_heads": 4,
+                "pair_fusion_hidden_dim": 48,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "motion_mode": "translation",
+                "refinement_factors": [8, 4, 2],
+                "refinement_channels": [8, 8, 8],
+                "refinement_blocks_per_stage": 1,
+                "refinement_maximum_residual_vox": [1.0, 1.0, 1.0],
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(
+            model.architecture_revision,
+            "gaussian_native_v10",
+        )
+        self.assertIsNotNone(model.residual_pyramid)
+        moving = torch.rand(1, 1, 32, 32, 32)
+        output = model(moving, moving.clone(), return_aux=True)
+        self.assertEqual(output["pyramid_factors"], (8, 4, 2))
+        self.assertEqual(len(output["pyramid_flow"]), 3)
+        self.assertEqual(tuple(output["flow"].shape[2:]), (32, 32, 32))
+
+    def test_response_aware_supervised_anatomy_loss(self):
+        moving_seg = torch.zeros(1, 1, 16, 16, 16, dtype=torch.long)
+        fixed_seg = torch.zeros_like(moving_seg)
+        moving_seg[:, :, 4:9, 4:9, 4:9] = 1
+        fixed_seg.copy_(moving_seg)
+        flow = torch.zeros(1, 3, 16, 16, 16)
+        output = {
+            "flow": flow,
+            "pyramid_flow": [
+                torch.zeros(1, 3, 2, 2, 2),
+                torch.zeros(1, 3, 4, 4, 4),
+                torch.zeros(1, 3, 8, 8, 8),
+            ],
+        }
+        config = {
+            "enabled": True,
+            "labels": [1, 2],
+            "deep_supervision_weights": [0.1, 0.2, 0.3, 0.4],
+            "weight_factor_start": 0.2,
+            "weight_factor_end": 1.0,
+            "weight_ramp_epochs": 3,
+        }
+        terms = _supervised_anatomy_loss(
+            output,
+            moving_seg,
+            fixed_seg,
+            torch.tensor([[True, False]]),
+            config,
+        )
+        self.assertLess(float(terms["supervised_dice"]), 1.0e-5)
+        self.assertLess(
+            float(terms["supervised_boundary"]),
+            1.0e-5,
+        )
+        self.assertAlmostEqual(
+            float(terms["supervised_final_dice"]),
+            1.0,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            _supervised_anatomy_factor(config, 1),
+            0.2,
+        )
+        self.assertAlmostEqual(
+            _supervised_anatomy_factor(config, 3),
+            1.0,
+        )
 
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {

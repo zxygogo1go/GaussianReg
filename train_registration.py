@@ -403,6 +403,170 @@ def _synthetic_supervision(
     }
 
 
+def _supervised_anatomy_factor(
+    config: Mapping[str, object],
+    epoch: int,
+) -> float:
+    """Cosine-ramp segmentation supervision without changing loss ratios."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    if not bool(config.get("enabled", False)):
+        return 0.0
+    start = float(config.get("weight_factor_start", 0.20))
+    end = float(config.get("weight_factor_end", 1.0))
+    ramp_epochs = int(config.get("weight_ramp_epochs", 15))
+    if (
+        start < 0.0
+        or end < 0.0
+        or ramp_epochs <= 0
+    ):
+        raise ValueError("invalid supervised anatomy schedule")
+    if ramp_epochs == 1:
+        return end
+    progress = min(
+        max(float(epoch - 1) / float(ramp_epochs - 1), 0.0),
+        1.0,
+    )
+    return end + 0.5 * (start - end) * (
+        1.0 + np.cos(np.pi * progress)
+    )
+
+
+def _soft_boundary(mask: torch.Tensor) -> torch.Tensor:
+    dilation = F.max_pool3d(mask, kernel_size=3, stride=1, padding=1)
+    erosion = -F.max_pool3d(
+        -mask,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )
+    return (dilation - erosion).clamp(0.0, 1.0)
+
+
+def _masked_soft_dice(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    spatial_dims = tuple(range(2, prediction.ndim))
+    numerator = 2.0 * (prediction * target).sum(dim=spatial_dims)
+    denominator = prediction.square().sum(
+        dim=spatial_dims
+    ) + target.square().sum(dim=spatial_dims)
+    score = (numerator + 1.0e-5) / (denominator + 1.0e-5)
+    valid_float = valid.to(score.dtype)
+    valid_count = valid_float.sum()
+    loss = (
+        ((1.0 - score) * valid_float).sum()
+        / valid_count.clamp_min(1.0)
+    )
+    loss = torch.where(
+        valid_count > 0.0,
+        loss,
+        prediction.sum() * 0.0,
+    )
+    mean_score = (
+        (score * valid_float).sum()
+        / valid_count.clamp_min(1.0)
+    )
+    return loss, mean_score
+
+
+def _supervised_anatomy_loss(
+    output: Mapping[str, object],
+    moving_seg: torch.Tensor,
+    fixed_seg: torch.Tensor,
+    response_valid: torch.Tensor,
+    config: Mapping[str, object],
+) -> Dict[str, torch.Tensor]:
+    """Response-aware multi-scale Dice and final-boundary supervision."""
+    labels = tuple(int(value) for value in config.get("labels", (1, 2)))
+    if not labels:
+        raise ValueError("supervised anatomy requires at least one label")
+    valid = response_valid.to(
+        device=output["flow"].device,
+        dtype=torch.bool,
+    )
+    if valid.ndim != 2 or valid.shape[1] != len(labels):
+        raise AssertionError(
+            "response_valid must have shape [B, number_of_labels]"
+        )
+    moving_one_hot = torch.cat(
+        [(moving_seg == label).float() for label in labels],
+        dim=1,
+    )
+    fixed_one_hot = torch.cat(
+        [(fixed_seg == label).float() for label in labels],
+        dim=1,
+    )
+    stage_flows = list(output.get("pyramid_flow", ()))
+    flows = stage_flows + [output["flow"]]
+    configured_weights = tuple(
+        float(value)
+        for value in config.get(
+            "deep_supervision_weights",
+            (0.10, 0.20, 0.30, 0.40),
+        )
+    )
+    if len(configured_weights) != len(flows) or any(
+        value < 0.0 for value in configured_weights
+    ):
+        raise ValueError(
+            "deep supervision weights must match pyramid stages plus final flow"
+        )
+    weight_sum = sum(configured_weights)
+    if weight_sum <= 0.0:
+        raise ValueError("deep supervision weights must have positive sum")
+    weights = tuple(value / weight_sum for value in configured_weights)
+    dice_loss = output["flow"].new_zeros((), dtype=torch.float32)
+    final_prediction = None
+    final_target = None
+    final_score = output["flow"].new_zeros((), dtype=torch.float32)
+    for flow, weight in zip(flows, weights):
+        size = flow.shape[2:]
+        moving_scale = F.interpolate(
+            moving_one_hot,
+            size=size,
+            mode="trilinear",
+            align_corners=True,
+        )
+        fixed_scale = F.interpolate(
+            fixed_one_hot,
+            size=size,
+            mode="trilinear",
+            align_corners=True,
+        )
+        warped = warp_tensor(
+            moving_scale,
+            flow.float(),
+            padding_mode="zeros",
+        ).clamp(0.0, 1.0)
+        current_loss, current_score = _masked_soft_dice(
+            warped,
+            fixed_scale,
+            valid,
+        )
+        dice_loss = dice_loss + float(weight) * current_loss
+        final_prediction = warped
+        final_target = fixed_scale
+        final_score = current_score
+
+    if final_prediction is None or final_target is None:
+        raise AssertionError("supervised anatomy requires at least one flow")
+    boundary_loss, boundary_score = _masked_soft_dice(
+        _soft_boundary(final_prediction),
+        _soft_boundary(final_target),
+        valid,
+    )
+    return {
+        "supervised_dice": dice_loss,
+        "supervised_boundary": boundary_loss,
+        "supervised_final_dice": final_score,
+        "supervised_final_boundary_dice": boundary_score,
+        "supervised_valid_classes": valid.float().sum(),
+    }
+
+
 def _configure_training_stage(
     model: torch.nn.Module,
     config: Mapping[str, object],
@@ -438,18 +602,25 @@ def _configure_training_stage(
         dict(config.get("synthetic_deformation", {})),
         epoch,
     )
+    anatomy_factor = _supervised_anatomy_factor(
+        dict(config.get("supervised_anatomy", {})),
+        epoch,
+    )
     if correspondence_warmup:
         stage_name = "correspondence_warmup"
     elif synthetic_probability >= 1.0:
         stage_name = "synthetic_deformation_warmup"
     elif synthetic_probability > 0.0:
         stage_name = "joint_with_synthetic_deformation"
+    elif 0.0 < anatomy_factor < 1.0:
+        stage_name = "supervised_pyramid_ramp"
     else:
         stage_name = "joint"
     return {
         "name": stage_name,
         "velocity_head_trainable": not correspondence_warmup,
         "synthetic_deformation_probability": synthetic_probability,
+        "supervised_anatomy_factor": anatomy_factor,
         "trainable_parameters": sum(
             parameter.numel()
             for parameter in model.parameters()
@@ -471,6 +642,8 @@ def _train_epoch(
     augmentation: Mapping[str, object],
     synthetic_deformation: Mapping[str, object],
     synthetic_probability: float,
+    supervised_anatomy: Mapping[str, object],
+    supervised_anatomy_factor: float,
     gradient_clip: float,
     epoch: int,
     log_every: int,
@@ -496,6 +669,21 @@ def _train_epoch(
         or synthetic_correspondence_weight < 0.0
     ):
         raise ValueError("invalid synthetic training probability or weights")
+    supervised_enabled = bool(
+        supervised_anatomy.get("enabled", False)
+    )
+    supervised_dice_weight = float(
+        supervised_anatomy.get("dice_loss_weight", 0.0)
+    )
+    supervised_boundary_weight = float(
+        supervised_anatomy.get("boundary_loss_weight", 0.0)
+    )
+    if (
+        supervised_anatomy_factor < 0.0
+        or supervised_dice_weight < 0.0
+        or supervised_boundary_weight < 0.0
+    ):
+        raise ValueError("invalid supervised anatomy weights")
     spacing_dhw = getattr(model, "spacing_dhw", None)
     if synthetic_probability > 0.0 and spacing_dhw is None:
         raise ValueError(
@@ -505,6 +693,21 @@ def _train_epoch(
     for step, sample in enumerate(loader, start=1):
         moving = sample["moving"].to(device, non_blocking=True)
         fixed = sample["fixed"].to(device, non_blocking=True)
+        moving_seg = (
+            sample["moving_seg"].to(device, non_blocking=True)
+            if supervised_enabled
+            else None
+        )
+        fixed_seg = (
+            sample["fixed_seg"].to(device, non_blocking=True)
+            if supervised_enabled
+            else None
+        )
+        response_valid = (
+            sample["response_valid"].to(device, non_blocking=True)
+            if supervised_enabled
+            else None
+        )
         moving, fixed = _augment_pair(moving, fixed, augmentation)
         target_flow = None
         if (
@@ -547,11 +750,43 @@ def _train_epoch(
                 synthetic_fraction = zero + 1.0
             terms.update(synthetic_terms)
             terms["synthetic_fraction"] = synthetic_fraction
+            if supervised_enabled and target_flow is None:
+                if (
+                    moving_seg is None
+                    or fixed_seg is None
+                    or response_valid is None
+                ):
+                    raise AssertionError(
+                        "supervised anatomy batch is missing segmentations"
+                    )
+                supervised_terms = _supervised_anatomy_loss(
+                    output,
+                    moving_seg,
+                    fixed_seg,
+                    response_valid,
+                    supervised_anatomy,
+                )
+            else:
+                supervised_terms = {
+                    "supervised_dice": zero,
+                    "supervised_boundary": zero,
+                    "supervised_final_dice": zero,
+                    "supervised_final_boundary_dice": zero,
+                    "supervised_valid_classes": zero,
+                }
+            terms.update(supervised_terms)
             terms["total"] = (
                 terms["total"]
                 + synthetic_flow_weight * terms["synthetic_flow"]
                 + synthetic_correspondence_weight
                 * terms["synthetic_correspondence"]
+                + supervised_anatomy_factor
+                * (
+                    supervised_dice_weight
+                    * terms["supervised_dice"]
+                    + supervised_boundary_weight
+                    * terms["supervised_boundary"]
+                )
             )
         if not bool(torch.isfinite(terms["total"]).detach()):
             raise FloatingPointError("non-finite loss for patients %s" % list(sample["patient_id"]))
@@ -939,15 +1174,49 @@ def _fail_fast_reason(
     ]
     finite_gains = [value for value in finite_gains if np.isfinite(value)]
     best_gain = max(finite_gains, default=-float("inf"))
+    finite_dice_gains = [
+        float(
+            item["validation"].get(
+                "dice_improvement",
+                float("nan"),
+            )
+        )
+        for item in history
+    ]
+    finite_dice_gains = [
+        value for value in finite_dice_gains if np.isfinite(value)
+    ]
+    best_dice_gain = max(
+        finite_dice_gains,
+        default=-float("inf"),
+    )
     for threshold in monitoring.get("progress_thresholds", ()):
         threshold = dict(threshold)
         threshold_epoch = int(threshold["epoch"])
-        minimum_gain = float(threshold["minimum_best_ncc_improvement"])
-        if epoch == threshold_epoch and best_gain <= minimum_gain:
-            return (
-                "best NCC improvement %.5f did not exceed %.5f at epoch %d"
-                % (best_gain, minimum_gain, epoch)
+        if epoch != threshold_epoch:
+            continue
+        if "minimum_best_ncc_improvement" in threshold:
+            minimum_gain = float(
+                threshold["minimum_best_ncc_improvement"]
             )
+            if best_gain <= minimum_gain:
+                return (
+                    "best NCC improvement %.5f did not exceed %.5f at epoch %d"
+                    % (best_gain, minimum_gain, epoch)
+                )
+        if "minimum_best_dice_improvement" in threshold:
+            minimum_dice_gain = float(
+                threshold["minimum_best_dice_improvement"]
+            )
+            if best_dice_gain <= minimum_dice_gain:
+                return (
+                    "best Dice improvement %.5f did not exceed %.5f at epoch %d"
+                    % (
+                        best_dice_gain,
+                        minimum_dice_gain,
+                        epoch,
+                    )
+                )
     return ""
 
 
@@ -959,12 +1228,13 @@ def _checkpoint(
     scaler: torch.cuda.amp.GradScaler,
     config: Mapping[str, object],
     manifests: Mapping[str, str],
-    best_validation_ncc: float,
+    best_validation_score: float,
+    selection_metric: str,
     train_metrics: Mapping[str, float],
     validation_metrics: Mapping[str, float],
 ) -> Dict[str, object]:
     return {
-        "format_version": 3,
+        "format_version": 4,
         "architecture_revision": getattr(
             model,
             "architecture_revision",
@@ -977,7 +1247,16 @@ def _checkpoint(
         "scaler": scaler.state_dict(),
         "config": dict(config),
         "manifest_sha256": dict(manifests),
-        "best_validation_ncc": float(best_validation_ncc),
+        "best_validation_score": float(best_validation_score),
+        "selection_metric": str(selection_metric),
+        "best_validation_ncc": float(best_validation_score)
+        if selection_metric == "ncc_after"
+        else float(
+            validation_metrics.get(
+                "ncc_after",
+                -float("inf"),
+            )
+        ),
         "correspondence_temperature": train_metrics.get(
             "correspondence_temperature"
         ),
@@ -1030,13 +1309,27 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     synthetic_deformation = dict(
         config.get("synthetic_deformation", {})
     )
+    supervised_anatomy = dict(
+        config.get("supervised_anatomy", {})
+    )
+    supervised_enabled = bool(
+        supervised_anatomy.get("enabled", False)
+    )
+    if supervised_enabled and (
+        float(augmentation.get("reverse_pair_probability", 0.0)) > 0.0
+        or float(augmentation.get("shared_flip_probability", 0.0)) > 0.0
+    ):
+        raise ValueError(
+            "segmentation-supervised training requires reverse and flip "
+            "augmentation probabilities to be zero"
+        )
     data_config = dict(config.get("data", {}))
     shape = tuple(int(value) for value in data_config.get("shape_dhw", (128, 160, 160)))
     train_dataset = HeadNeckRegistrationDataset(
         args.train_manifest,
         args.data_root,
         expected_shape=shape,
-        load_segmentations=False,
+        load_segmentations=supervised_enabled,
     )
     validation_dataset = HeadNeckRegistrationDataset(
         args.validation_manifest,
@@ -1162,15 +1455,47 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     }
     save_json(output_dir / "resolved_config.json", resolved)
 
+    monitoring = dict(config.get("monitoring", {}))
+    selection_aliases = {
+        "ncc": "ncc_after",
+        "ncc_after": "ncc_after",
+        "dice": "mean_dice",
+        "mean_dice": "mean_dice",
+    }
+    requested_selection = str(
+        monitoring.get("selection_metric", "ncc_after")
+    ).strip().lower()
+    if requested_selection not in selection_aliases:
+        raise ValueError(
+            "monitoring.selection_metric must be ncc_after or mean_dice"
+        )
+    selection_metric = selection_aliases[requested_selection]
+    best_checkpoint_name = (
+        "best_validation_dice.pt"
+        if selection_metric == "mean_dice"
+        else "best_validation_ncc.pt"
+    )
+    print(
+        "checkpoint_selection=%s filename=%s"
+        % (selection_metric, best_checkpoint_name)
+    )
     start_epoch = 1
-    best_validation_ncc = -float("inf")
+    best_validation_score = -float("inf")
     if resume_checkpoint is not None:
         model.load_state_dict(resume_checkpoint["model"], strict=True)
         optimizer.load_state_dict(resume_checkpoint["optimizer"])
         scheduler.load_state_dict(resume_checkpoint["scheduler"])
         scaler.load_state_dict(resume_checkpoint.get("scaler", {}))
         start_epoch = int(resume_checkpoint["epoch"]) + 1
-        best_validation_ncc = float(resume_checkpoint.get("best_validation_ncc", -float("inf")))
+        best_validation_score = float(
+            resume_checkpoint.get(
+                "best_validation_score",
+                resume_checkpoint.get(
+                    "best_validation_ncc",
+                    -float("inf"),
+                ),
+            )
+        )
         print("resumed from epoch %d" % (start_epoch - 1))
 
     writer = _make_writer(output_dir)
@@ -1179,7 +1504,6 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     checkpoint_every = int(optimization.get("checkpoint_every", 25))
     gradient_clip = float(optimization.get("gradient_clip", 5.0))
     log_every = int(optimization.get("log_every", 10))
-    monitoring = dict(config.get("monitoring", {}))
     validation_history = []
     if validate_every <= 0 or checkpoint_every <= 0 or gradient_clip <= 0.0 or log_every <= 0:
         raise ValueError("validation/checkpoint/log intervals and gradient_clip must be positive")
@@ -1223,6 +1547,8 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                         "synthetic_deformation_probability"
                     ]
                 ),
+                supervised_anatomy,
+                float(training_stage["supervised_anatomy_factor"]),
                 gradient_clip,
                 epoch,
                 log_every,
@@ -1248,6 +1574,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             train_metrics["synthetic_deformation_probability"] = float(
                 training_stage["synthetic_deformation_probability"]
             )
+            train_metrics["supervised_anatomy_factor"] = float(
+                training_stage["supervised_anatomy_factor"]
+            )
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:
                 validation_metrics = _validate(
@@ -1269,6 +1598,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             record = {
                 "epoch": epoch,
                 "training_stage": training_stage["name"],
+                "selection_metric": selection_metric,
                 "learning_rate": lr,
                 "train": train_metrics,
                 "validation": validation_metrics,
@@ -1285,7 +1615,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 epoch,
             )
 
-            score = float(validation_metrics.get("ncc_after", -float("inf")))
+            score = float(
+                validation_metrics.get(
+                    selection_metric,
+                    -float("inf"),
+                )
+            )
             ncc_gain = float(
                 validation_metrics.get(
                     "ncc_improvement",
@@ -1295,6 +1630,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             folding = float(
                 validation_metrics.get(
                     "negative_jacobian_ratio",
+                    float("nan"),
+                )
+            )
+            dice_gain = float(
+                validation_metrics.get(
+                    "dice_improvement",
                     float("nan"),
                 )
             )
@@ -1317,14 +1658,22 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                             float("inf"),
                         )
                     )
+                    and np.isfinite(dice_gain)
+                    and dice_gain
+                    > float(
+                        monitoring.get(
+                            "best_checkpoint_minimum_dice_improvement",
+                            -float("inf"),
+                        )
+                    )
                 )
             improved = (
                 eligible
                 and np.isfinite(score)
-                and score > best_validation_ncc
+                and score > best_validation_score
             )
             if improved:
-                best_validation_ncc = score
+                best_validation_score = score
             state = _checkpoint(
                 epoch,
                 model,
@@ -1333,17 +1682,24 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 scaler,
                 config,
                 manifests,
-                best_validation_ncc,
+                best_validation_score,
+                selection_metric,
                 train_metrics,
                 validation_metrics,
             )
             atomic_torch_save(state, output_dir / "latest.pt")
             if improved:
-                atomic_torch_save(state, output_dir / "best_validation_ncc.pt")
+                atomic_torch_save(
+                    state,
+                    output_dir / best_checkpoint_name,
+                )
             if epoch % checkpoint_every == 0 or epoch == epochs:
                 atomic_torch_save(state, output_dir / ("epoch_%04d.pt" % epoch))
             validation_dice = float(
                 validation_metrics.get("mean_dice", float("nan"))
+            )
+            validation_ncc = float(
+                validation_metrics.get("ncc_after", float("nan"))
             )
             validation_p95 = float(
                 validation_metrics.get("p95_displacement_mm", float("nan"))
@@ -1351,7 +1707,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             print(
                 "epoch %d complete stage=%s lr=%.3e "
                 "match_temp=%s appearance=%s "
-                "feature_residual=%s val_ncc=%s "
+                "feature_residual=%s sup_factor=%.3f "
+                "train_sup_dice=%.4f train_sup_boundary=%.4f "
+                "val_ncc=%s "
                 "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
                 "raw_e=%.4f/%.4f/%.4f motion_e=%.4f/%.4f/%.4f "
                 "diag0=%.4f residual0=%.3f delta0_mm=%.3f anchor2=%.3f "
@@ -1370,7 +1728,26 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     "%.4f" % match_feature_residual_weight
                     if match_feature_residual_weight is not None
                     else "n/a",
-                    "%.5f" % score if np.isfinite(score) else "not-run",
+                    float(
+                        training_stage[
+                            "supervised_anatomy_factor"
+                        ]
+                    ),
+                    float(
+                        train_metrics.get(
+                            "supervised_dice",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "supervised_boundary",
+                            float("nan"),
+                        )
+                    ),
+                    "%.5f" % validation_ncc
+                    if np.isfinite(validation_ncc)
+                    else "not-run",
                     "%.5f" % validation_dice
                     if np.isfinite(validation_dice)
                     else "not-run",
@@ -1473,7 +1850,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                             float("nan"),
                         )
                     ),
-                    best_validation_ncc,
+                    best_validation_score,
                 )
             )
             warning = _collapse_warning(

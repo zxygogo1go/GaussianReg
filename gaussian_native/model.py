@@ -13,6 +13,7 @@ from .correspondence import HierarchicalGaussianCorrespondence
 from .decomposition import HierarchicalGaussianDecomposer
 from .encoding import HierarchicalGaussianEncoder
 from .integration import ScalingAndSquaring, warp_tensor
+from .refinement import GaussianGuidedResidualPyramid
 from .velocity import (
     GaussianVelocityHead,
     HierarchicalGaussianVelocitySynthesis,
@@ -70,6 +71,14 @@ class GaussianNativeRegistration(nn.Module):
         pair_score_heads: int = 4,
         pair_fusion_hidden_dim: Optional[int] = None,
         pair_context_temperature: float = 0.20,
+        refinement_factors: Sequence[int] = (8, 4, 2),
+        refinement_channels: Sequence[int] = (48, 40, 32),
+        refinement_blocks_per_stage: int = 3,
+        refinement_maximum_residual_vox: Sequence[float] = (
+            1.5,
+            1.0,
+            0.75,
+        ),
         include_identity_candidate: Optional[bool] = None,
         match_evidence_power: float = 1.0,
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
@@ -91,6 +100,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -102,6 +112,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -111,6 +122,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -120,6 +132,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
@@ -127,13 +140,18 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         use_residual_pair_motion = self.architecture_revision in {
             "gaussian_native_v7",
             "gaussian_native_v8",
             "gaussian_native_v9",
+            "gaussian_native_v10",
         }
+        use_pyramid_refinement = (
+            self.architecture_revision == "gaussian_native_v10"
+        )
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
         rotation_limit = (
@@ -257,6 +275,19 @@ class GaussianNativeRegistration(nn.Module):
             use_canonical_basis=use_stable_motion_basis,
         )
         self.integration = ScalingAndSquaring(steps=integration_steps)
+        self.residual_pyramid = (
+            GaussianGuidedResidualPyramid(
+                factors=refinement_factors,
+                channels=refinement_channels,
+                blocks_per_stage=refinement_blocks_per_stage,
+                maximum_residual_vox=(
+                    refinement_maximum_residual_vox
+                ),
+                integration_steps=integration_steps,
+            )
+            if use_pyramid_refinement
+            else None
+        )
 
     def set_correspondence_temperature(self, temperature: float) -> None:
         self.correspondence.set_temperature(temperature)
@@ -324,26 +355,53 @@ class GaussianNativeRegistration(nn.Module):
                 synthesis_shape,
                 fixed_decomposition["extent_mm"],
             )
-            velocity_mm = F.interpolate(
-                synthesis["velocity_mm"],
-                size=self.inshape,
-                mode="trilinear",
-                align_corners=True,
+        refinement = None
+        if self.residual_pyramid is not None:
+            refinement = self.residual_pyramid(
+                moving,
+                fixed,
+                synthesis["level_velocity_mm"],
+                spacing,
             )
-            velocity_vox = velocity_mm / spacing.view(moving.shape[0], 3, 1, 1, 1)
-            if self.integration_mode == "svf":
-                flow = self.integration(velocity_vox)
-                inverse_flow = self.integration(-velocity_vox)
-            else:
-                flow = velocity_vox
-                inverse_flow = -velocity_vox
+            velocity_vox = refinement["velocity_vox"]
+            flow = refinement["flow"]
+            inverse_flow = refinement["inverse_flow"]
+            velocity_mm = velocity_vox * spacing.view(
+                moving.shape[0],
+                3,
+                1,
+                1,
+                1,
+            )
+        else:
+            with _autocast_disabled(moving.device):
+                velocity_mm = F.interpolate(
+                    synthesis["velocity_mm"],
+                    size=self.inshape,
+                    mode="trilinear",
+                    align_corners=True,
+                )
+                velocity_vox = velocity_mm / spacing.view(
+                    moving.shape[0],
+                    3,
+                    1,
+                    1,
+                    1,
+                )
+                if self.integration_mode == "svf":
+                    flow = self.integration(velocity_vox)
+                    inverse_flow = self.integration(-velocity_vox)
+                else:
+                    flow = velocity_vox
+                    inverse_flow = -velocity_vox
+        with _autocast_disabled(moving.device):
             warped = warp_tensor(moving.float(), flow, padding_mode="zeros")
             inverse_warped = warp_tensor(fixed.float(), inverse_flow, padding_mode="zeros")
         if not return_aux:
             return warped, flow
         moving_decomposition["levels"] = moving_levels
         fixed_decomposition["levels"] = fixed_levels
-        return {
+        result = {
             "warped": warped,
             "flow": flow,
             "inverse_warped": inverse_warped,
@@ -357,6 +415,21 @@ class GaussianNativeRegistration(nn.Module):
             "level_velocity_mm": synthesis["level_velocity_mm"],
             "level_velocity_coverage": synthesis["level_coverage"],
         }
+        if refinement is not None:
+            result.update(
+                {
+                    "pyramid_factors": refinement["pyramid_factors"],
+                    "pyramid_velocity_vox": refinement[
+                        "pyramid_velocity_vox"
+                    ],
+                    "pyramid_residual_velocity_vox": refinement[
+                        "pyramid_residual_velocity_vox"
+                    ],
+                    "pyramid_flow": refinement["pyramid_flow"],
+                    "pyramid_warped": refinement["pyramid_warped"],
+                }
+            )
+        return result
 
 
 __all__ = ["GaussianNativeRegistration"]

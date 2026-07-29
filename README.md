@@ -21,7 +21,10 @@ Per-Gaussian local affine stationary velocity
         ↓
 Multi-scale Gaussian SVF synthesis
         ↓
-Scaling-and-squaring
+Gaussian-guided coarse-to-fine residual SVF pyramid
+factor 8 → warp → factor 4 → warp → factor 2 → warp
+        ↓
+Full-resolution scaling-and-squaring
         ↓
 Dense diffeomorphic deformation
 ```
@@ -34,13 +37,17 @@ The implementation is organized around two research modules:
    uses strict sparse candidate support and a bounded learned residual on top
    of a fixed appearance/geometric matching base; Sinkhorn and an unmatched
    dustbin remain ablations.
-2. **Gaussian Stationary Velocity Field Generator (GSVF)** predicts
+2. **Gaussian-Guided Residual Diffeomorphic Pyramid (GGRP)** predicts
    translation, rotation, and bounded strain for every Gaussian, rasterizes
-   coarse-to-fine residual velocities, and integrates the SVF into a
-   diffeomorphism.
+   the three Gaussian velocity components, and then performs sequential
+   image-warped residual SVF refinement at factors 8, 4, and 2. The accumulated
+   full-resolution stationary velocity is integrated into a diffeomorphism.
 
-There is no SACB branch, learned dense-flow head, Gaussian/dense gate, or
-standalone confidence module in the new prediction path.
+There is no SACB branch, Gaussian/dense gate, or standalone confidence module
+in the new prediction path. Revision v10 deliberately adds a conventional
+voxel residual refiner after Gaussian correspondence; it is therefore a
+Gaussian-guided hybrid rather than a strictly Gaussian-only model. Revision v9
+is retained as the strict Gaussian-only unsupervised ablation.
 
 ## Environment
 
@@ -63,7 +70,10 @@ learned residual scorer.
 The main experiment is within-patient longitudinal T2 MRI registration. Raw
 preRT after rigid/affine prealignment is moving and midRT is fixed. The
 challenge-provided deformably registered preRT image is excluded. Tumor labels
-(`1=GTVp`, `2=GTVn`) are reserved for validation and testing.
+are `1=GTVp` and `2=GTVn`. Revision v10 uses the paired labels during
+training; a class contributes only when present at both timepoints.
+Consequently v10 must be reported as segmentation-supervised and compared
+with supervised baselines. Revision v9 remains the label-free comparison.
 
 Preprocessing creates 1.5 mm isotropic `(D,H,W)=(128,160,160)` volumes,
 performs robust MRI normalization and geometry QA, and writes patient-disjoint
@@ -84,28 +94,26 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
-The current production revision is v9. It retains strict masked row-softmax,
-the canonical 64/256/1024 hierarchy, no forced identity candidate, and
-square-root match evidence. The matching capacity is now concentrated in a
-multi-head bidirectional Gaussian context scorer. It aggregates moving context
-for every fixed Gaussian and fixed context for every moving Gaussian, fuses
-that context with the node features, and predicts a bounded residual from
-multi-head similarities plus appearance, position, scale, and mass relations.
+The current experimental revision is v10. It retains v9's contextual Gaussian
+matcher, then injects the root, middle, and fine Gaussian velocity components
+sequentially into a true coarse-to-fine residual image pyramid. At every stage
+the current stationary velocity is integrated, the moving image is warped,
+and a bounded residual velocity is predicted from fixed image, warped moving
+image, their difference, and the current flow. This fixes the earlier one-shot
+design in which all Gaussian levels were matched before any image warp.
 
-The scorer remains zero-initialized at its last layer, so the first forward
-pass is anchored by normalized Gaussian intensity/derivative correlation.
-During epochs 1--8, training uses self-supervised synthetic diffeomorphisms with
-known dense flow and Gaussian transport targets. Epochs 9--60 retain synthetic
-pairs with probability 0.25 while optimizing the real longitudinal pairs.
-This supplies a positive matching signal without using tumor labels or
-penalizing anatomically valid same-index matches. Earlier revisions remain
-available only for reproducing prior experiments.
+The residual heads are zero-initialized, so v10 initially preserves the
+Gaussian field. Training uses response-aware multi-scale soft Dice and a final
+boundary loss for paired GTVp/GTVn, in addition to bidirectional image
+similarity and topology regularization. The learning rate warms up for five
+epochs and the anatomy-supervision factor ramps from 0.2 to 1.0 over 15 epochs.
+Synthetic deformation training is disabled in v10.
 
 First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_v9_hntsmrg24.json \
+  --config configs/gaussian_native_v10_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -114,25 +122,26 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v9_hntsmrg24.json \
+  --config configs/gaussian_native_v10_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v9_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v10_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
-The production model contains 64/256/1024 Gaussian primitives and 4,511,642
-trainable parameters, including 1,639,206 in correspondence. Training uses:
+The v10 model contains 64/256/1024 Gaussian primitives and 5,341,667 trainable
+parameters. A full `(128,160,160)` A100 forward/backward smoke test uses about
+6.3 GiB peak allocated GPU memory. Training uses:
 
 - bidirectional multi-scale LNCC and normalized-gradient similarity;
 - an anchored, mass-conserving Gaussian hierarchy without learned geometry
   predictors;
 - fixed-base plus multi-head bidirectional contextual Gaussian correspondence;
-- synthetic diffeomorphic flow and Gaussian-transport supervision during the
-  matching curriculum, without training labels;
+- sequential factor-8/4/2 residual SVF refinement after image warping;
+- response-aware multi-scale soft Dice and final tumor-boundary supervision;
 - SVF smoothness, inverse consistency, and a Jacobian safety barrier;
-- shared left-right flipping and shared MRI intensity augmentation.
+- shared MRI intensity augmentation.
 
 Each validation record includes NCC and Dice before/after registration,
 improvements, displacement, and topology. The console also reports coarse
@@ -140,25 +149,28 @@ support-normalized matching entropy, deterministic match evidence, row maximum,
 effective motion evidence, diagonal probability, and calibrated transport
 displacement. v9 additionally logs the synthetic-pair fraction, synthetic flow
 and transport losses, endpoint error, contextual-attention concentration, and
-mean absolute learned residual logit. The residual should be exactly zero
-before the first update and then become nonzero.
+mean absolute learned residual logit. v10 additionally logs residual velocity
+and accumulated flow magnitude at each pyramid stage, plus the supervised Dice
+and boundary terms. Every residual velocity head is exactly zero before the
+first update and should then become nonzero.
 Clearly harmful or stalled runs are stopped by configured fail-fast rules and
 retain a `failed_epoch_XXXX.pt` checkpoint with the exact reason.
 
-The best checkpoint is selected by validation NCC, not tumor Dice, and is
-written only when NCC improves over the unregistered pair and the negative
-Jacobian ratio is at most 1%. Resume only with the same configuration and
-manifest hashes:
+The v10 best checkpoint is selected by validation mean Dice and written as
+`best_validation_dice.pt` only when Dice improves over the unregistered pair,
+NCC degradation is below the configured tolerance, and the negative Jacobian
+ratio is at most 1%. Resume only with the same configuration and manifest
+hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v9_hntsmrg24.json \
+  --config configs/gaussian_native_v10_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v9_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v10_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v9_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v10_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -167,10 +179,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v9_hntsmrg24_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v10_hntsmrg24_seed2026/best_validation_dice.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v9_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v10_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```
@@ -215,7 +227,8 @@ python -m unittest discover -s tests -v
 The focused suite covers full SPD geometry, mass-conserving hierarchy,
 partial transport, parent-conditioned matching, Gaussian velocity synthesis,
 identity initialization, scaling-and-squaring inverse composition, full-model
-gradients, DHW flow direction, medical metrics, and dataset behavior.
+gradients, true residual-pyramid propagation, response-aware soft-label
+supervision, DHW flow direction, medical metrics, and dataset behavior.
 
 ## SACB-Net citation
 

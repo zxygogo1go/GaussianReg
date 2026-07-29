@@ -3,16 +3,20 @@
 ## 1. Scope
 
 The model registers a moving longitudinal head-and-neck T2 MRI to a fixed T2
-MRI. Learned intermediate states and learned deformation degrees of freedom
-are Gaussian primitives. Dense voxel tensors are used only for:
+MRI. Revisions v1--v9 use Gaussian primitives for all learned intermediate
+states and deformation degrees of freedom. Dense voxel tensors are used only
+for:
 
 - fixed Gaussian scale-space measurements of the input;
 - deterministic Gaussian reconstruction/velocity rasterization;
 - scaling-and-squaring integration;
 - final image and label resampling.
 
-The new model has no SACB, voxel CNN feature hierarchy, dense displacement
-head, Gaussian/dense fusion, confidence gate, or learned dense residual.
+The new model has no SACB, Gaussian/dense gate, or learned confidence module.
+Revision v10 adds a three-stage voxel CNN that predicts bounded residual
+stationary velocities after each coarse-to-fine image warp. v10 is therefore a
+Gaussian-guided hybrid registration model; v9 remains the strict
+Gaussian-only ablation.
 
 ## 2. Coordinate convention
 
@@ -265,7 +269,37 @@ Kernels are truncated at 3.5 standard deviations and evaluated in node
 chunks. The production field is synthesized on the factor-four grid, summed
 across hierarchy levels, and physically upsampled before integration.
 
-### 4.4 Diffeomorphic integration
+### 4.4 V10 Gaussian-guided residual image pyramid
+
+Revision v10 does not sum all three Gaussian fields and warp only once.
+Instead, the root, middle, and fine Gaussian residual fields are injected
+sequentially at image factors 8, 4, and 2. At stage \(s\), accumulated
+stationary velocity \(v_{s-1}\) is integrated and used to warp the moving
+image. A residual CNN then predicts:
+
+\[
+\delta v_s =
+\alpha_s\tanh f_s\left(
+I^F_s,\,
+I^M_s\circ\exp(v_{s-1}),\,
+I^F_s-I^M_s\circ\exp(v_{s-1}),\,
+\exp(v_{s-1})
+\right).
+\]
+
+The stage update is additive in stationary-velocity space:
+
+\[
+v_s =
+\operatorname{up}(v_{s-1}) + v_s^{G} + \delta v_s.
+\]
+
+Scale-aware upsampling converts displacement units correctly between pyramid
+levels. Residual bounds are 1.5, 1.0, and 0.75 voxels at factors 8, 4, and 2.
+Each residual output convolution is initialized to zero, so v10 starts from
+the Gaussian deformation rather than an unrelated dense field.
+
+### 4.5 Diffeomorphic integration
 
 The physical velocity is converted to DHW voxel units and integrated using
 seven scaling-and-squaring steps:
@@ -274,8 +308,10 @@ seven scaling-and-squaring steps:
 \phi=\exp(v),\qquad \phi^{-1}=\exp(-v).
 \]
 
-The model returns both forward and inverse flows. No learned operation is
-applied after Gaussian velocity synthesis.
+The model returns both forward and inverse flows. Through revision v9, no
+learned operation follows Gaussian velocity synthesis. In v10, the accumulated
+factor-two stationary velocity is physically upsampled to full resolution and
+then integrated.
 
 ## 5. Training objective
 
@@ -300,8 +336,9 @@ The objective has four reported groups:
    - Jacobian safety barrier;
    - small velocity magnitude penalty.
 
-Labels are never loaded by the training dataset. Validation and test labels are
-used only for response-aware Dice, HD95, and ASSD.
+Through revision v9, labels are never loaded by the training dataset.
+Validation and test labels are used only for response-aware Dice, HD95, and
+ASSD.
 
 Production v8 used a correspondence-first curriculum. During epochs 1--5, the
 learned velocity-head parameters are frozen while differentiable direct
@@ -331,7 +368,18 @@ representation--matching--motion chain. This curriculum teaches sensitivity to
 known non-identity anatomy while allowing correct same-index correspondence
 after affine prealignment.
 
-## 6. Production configuration
+Revision v10 disables the synthetic curriculum and loads paired GTVp/GTVn
+segmentations for training. A class is valid only when it is present in both
+the unwarped moving and fixed masks, which prevents response-related
+appearance/disappearance from being treated as a registration error.
+Trilinearly downsampled one-hot masks supervise the three pyramid flows and the
+final full-resolution flow with normalized weights 0.1/0.2/0.3/0.4. The
+soft-Dice denominator uses squared probabilities so identical soft masks have
+zero loss. A final soft-boundary Dice term receives weight 0.2. The combined
+anatomy factor ramps from 0.2 to 1.0 over 15 epochs. This setting is
+segmentation-supervised and must not be compared as if it were unsupervised.
+
+## 6. V10 experimental configuration
 
 - Input: `128×160×160`, 1.5 mm isotropic.
 - Gaussian counts: `64/256/1024`.
@@ -342,22 +390,25 @@ after affine prealignment.
 - Production transport: strict-support row-softmax.
 - Contextual pair scorer: eight heads, 256 context channels, 320 fusion
   channels, and 160 pair-score hidden channels.
-- Fixed appearance base weight: cosine 0.85 to 0.45 over 40 epochs.
-- Learned residual multiplier: cosine 0.15 to 1.0 over 30 epochs.
-- Maximum learned residual logit before the multiplier: 2.5.
-- Matching temperature: cosine 0.15 to 0.08 over 50 epochs.
+- Fixed appearance base weight: cosine 0.85 to 0.55 over 50 epochs.
+- Learned residual multiplier: cosine 0.10 to 0.40 over 40 epochs.
+- Maximum learned residual logit before the multiplier: 1.5.
+- Matching temperature: cosine 0.16 to 0.11 over 60 epochs.
 - Position weight: 0.03.
 - Production dustbin mass: 0.
 - Production motion: translation-only local Gaussian residuals.
-- Direct residual fractions: 0.55/0.85/0.75 for root/middle/fine levels.
+- Direct residual fractions: 0.45/0.70/0.60 for root/middle/fine levels.
 - Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
+- Residual image pyramid: factors 8/4/2, channels 48/40/32, three residual
+  blocks per stage.
+- Residual velocity limits: 1.5/1.0/0.75 stage voxels.
 - Integration steps: 7.
-- Trainable parameters: 4,511,642.
-- Correspondence parameters: 1,639,206.
+- Trainable parameters: 5,341,667.
 - Training autocast: bfloat16.
-- Synthetic-deformation warmup: 8 epochs; 25% synthetic sampling through
-  epoch 60.
+- Response-aware GTV soft Dice plus final boundary Dice supervision.
+- Anatomy-supervision ramp: 15 epochs.
+- Synthetic-deformation training: disabled.
 - Learning-rate warmup: 5 epochs.
 - AMP weight cache: disabled to preserve gradients across no-gradient
   fixed-to-fixed calibration and trainable fixed-to-moving matching.
@@ -369,7 +420,8 @@ Main comparison:
 
 - original SACB-Net;
 - strongest retained historical result reported from its archived metrics;
-- Gaussian-native model.
+- strict Gaussian-only v9 model;
+- segmentation-supervised Gaussian-guided v10 model.
 
 Required ablations:
 
@@ -382,6 +434,9 @@ Required ablations:
 - without inverse consistency;
 - fixed-base matcher versus fixed-base plus learned residual scorer;
 - adaptive versus anchored Gaussian geometry.
+- Gaussian-only synthesis versus Gaussian-guided residual pyramid;
+- v10 without label supervision versus Dice only versus Dice plus boundary;
+- shallow versus three-stage residual refinement.
 
 The implementation exposes `model.motion_mode` (`translation`, `se3`, or
 `affine`), `model.integration_mode` (`direct` or `svf`), and a zero
