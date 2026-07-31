@@ -237,6 +237,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v8",
         "gaussian_native_v9",
         "gaussian_native_v10",
+        "gaussian_native_v11",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -245,6 +246,15 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
     learned_fractions = model.get(
         "learned_translation_fractions",
         (0.20, 0.12, 0.08) if stable_motion_basis else None,
+    )
+    refinement_blocks_config = model.get(
+        "refinement_blocks_per_stage",
+        3,
+    )
+    refinement_blocks = (
+        tuple(int(value) for value in refinement_blocks_config)
+        if isinstance(refinement_blocks_config, (list, tuple))
+        else int(refinement_blocks_config)
     )
     return GaussianNativeRegistration(
         inshape=shape,
@@ -315,14 +325,18 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
                 (48, 40, 32),
             )
         ),
-        refinement_blocks_per_stage=int(
-            model.get("refinement_blocks_per_stage", 3)
-        ),
+        refinement_blocks_per_stage=refinement_blocks,
         refinement_maximum_residual_vox=tuple(
             float(value)
             for value in model.get(
                 "refinement_maximum_residual_vox",
                 (1.5, 1.0, 0.75),
+            )
+        ),
+        refinement_use_gradient_features=bool(
+            model.get(
+                "refinement_use_gradient_features",
+                False,
             )
         ),
         include_identity_candidate=(

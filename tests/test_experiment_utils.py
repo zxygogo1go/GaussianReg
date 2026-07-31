@@ -20,6 +20,7 @@ from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 from model import SACB_Net
 from train_registration import (
     _augment_pair,
+    _augment_pair_with_segmentations,
     _collapse_warning,
     _configure_training_stage,
     _fail_fast_reason,
@@ -538,6 +539,7 @@ class ExperimentUtilityTests(unittest.TestCase):
         flow = torch.zeros(1, 3, 16, 16, 16)
         output = {
             "flow": flow,
+            "inverse_flow": flow.clone(),
             "pyramid_flow": [
                 torch.zeros(1, 3, 2, 2, 2),
                 torch.zeros(1, 3, 4, 4, 4),
@@ -564,6 +566,14 @@ class ExperimentUtilityTests(unittest.TestCase):
             float(terms["supervised_boundary"]),
             1.0e-5,
         )
+        self.assertLess(
+            float(terms["supervised_centroid"]),
+            1.0e-5,
+        )
+        self.assertLess(
+            float(terms["supervised_inverse_dice"]),
+            1.0e-5,
+        )
         self.assertAlmostEqual(
             float(terms["supervised_final_dice"]),
             1.0,
@@ -576,6 +586,68 @@ class ExperimentUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(
             _supervised_anatomy_factor(config, 3),
             1.0,
+        )
+
+    def test_v11_builder_adds_full_resolution_gradient_stage(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v11",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "row_softmax",
+                "correspondence_score_mode": "contextual_residual",
+                "appearance_weight": 0.8,
+                "feature_residual_weight": 0.1,
+                "pair_score_hidden_dim": 32,
+                "pair_context_dim": 32,
+                "pair_score_heads": 4,
+                "pair_fusion_hidden_dim": 48,
+                "dustbin_mass": 0.0,
+                "include_identity_candidate": False,
+                "motion_mode": "translation",
+                "refinement_factors": [8, 4, 2, 1],
+                "refinement_channels": [8, 8, 8, 8],
+                "refinement_blocks_per_stage": [1, 1, 1, 1],
+                "refinement_maximum_residual_vox": [
+                    1.0,
+                    1.0,
+                    1.0,
+                    0.5,
+                ],
+                "refinement_use_gradient_features": True,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(
+            model.architecture_revision,
+            "gaussian_native_v11",
+        )
+        self.assertEqual(model.residual_pyramid.factors, (8, 4, 2, 1))
+        self.assertTrue(
+            model.residual_pyramid.stages[-1].use_gradient_features
+        )
+        moving = torch.rand(1, 1, 32, 32, 32)
+        output = model(moving, moving.clone(), return_aux=True)
+        self.assertEqual(len(output["pyramid_flow"]), 4)
+        self.assertEqual(
+            tuple(output["pyramid_flow"][-1].shape[2:]),
+            (32, 32, 32),
         )
 
     def test_correspondence_temperature_schedule_boundaries(self):
@@ -767,6 +839,49 @@ class ExperimentUtilityTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(augmented_moving, augmented_fixed))
         self.assertFalse(torch.equal(augmented_moving, volume))
+
+    def test_supervised_flip_keeps_images_and_labels_aligned(self):
+        moving = torch.zeros(1, 1, 4, 4, 4)
+        fixed = torch.zeros_like(moving)
+        moving[:, :, 1, 2, 0] = 1.0
+        fixed[:, :, 2, 1, 1] = 1.0
+        moving_seg = moving.long()
+        fixed_seg = fixed.long()
+        (
+            augmented_moving,
+            augmented_fixed,
+            augmented_moving_seg,
+            augmented_fixed_seg,
+        ) = _augment_pair_with_segmentations(
+            moving,
+            fixed,
+            {
+                "enabled": True,
+                "reverse_pair_probability": 0.0,
+                "shared_flip_probability": 1.0,
+                "intensity_probability": 0.0,
+            },
+            moving_seg,
+            fixed_seg,
+        )
+        self.assertTrue(
+            torch.equal(
+                augmented_moving.round().long(),
+                augmented_moving_seg,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                augmented_fixed.round().long(),
+                augmented_fixed_seg,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                augmented_moving,
+                torch.flip(moving, dims=(-1,)),
+            )
+        )
 
 
 if __name__ == "__main__":

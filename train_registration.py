@@ -7,7 +7,7 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -132,22 +132,38 @@ def _apply_intensity_transform(
     return augmented.clamp(0.0, 1.0)
 
 
-def _augment_pair(
+def _augment_pair_with_segmentations(
     moving: torch.Tensor,
     fixed: torch.Tensor,
     config: Mapping[str, object],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    moving_seg: Optional[torch.Tensor] = None,
+    fixed_seg: Optional[torch.Tensor] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    if (moving_seg is None) != (fixed_seg is None):
+        raise ValueError(
+            "moving_seg and fixed_seg must be both present or both absent"
+        )
     if not bool(config.get("enabled", False)):
-        return moving, fixed
+        return moving, fixed, moving_seg, fixed_seg
     if float(torch.rand((), device=moving.device)) < float(
         config.get("reverse_pair_probability", 0.0)
     ):
         moving, fixed = fixed, moving
+        if moving_seg is not None:
+            moving_seg, fixed_seg = fixed_seg, moving_seg
     if float(torch.rand((), device=moving.device)) < float(
         config.get("shared_flip_probability", 0.0)
     ):
         moving = torch.flip(moving, dims=(-1,))
         fixed = torch.flip(fixed, dims=(-1,))
+        if moving_seg is not None:
+            moving_seg = torch.flip(moving_seg, dims=(-1,))
+            fixed_seg = torch.flip(fixed_seg, dims=(-1,))
     intensity_pair_mode = str(
         config.get("intensity_pair_mode", "independent")
     ).strip().lower()
@@ -158,8 +174,28 @@ def _augment_pair(
         return (
             _apply_intensity_transform(moving, transform),
             _apply_intensity_transform(fixed, transform),
+            moving_seg,
+            fixed_seg,
         )
-    return _augment_intensity(moving, config), _augment_intensity(fixed, config)
+    return (
+        _augment_intensity(moving, config),
+        _augment_intensity(fixed, config),
+        moving_seg,
+        fixed_seg,
+    )
+
+
+def _augment_pair(
+    moving: torch.Tensor,
+    fixed: torch.Tensor,
+    config: Mapping[str, object],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    moving, fixed, _, _ = _augment_pair_with_segmentations(
+        moving,
+        fixed,
+        config,
+    )
+    return moving, fixed
 
 
 def _synthetic_deformation_probability(
@@ -447,6 +483,7 @@ def _masked_soft_dice(
     prediction: torch.Tensor,
     target: torch.Tensor,
     valid: torch.Tensor,
+    label_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spatial_dims = tuple(range(2, prediction.ndim))
     numerator = 2.0 * (prediction * target).sum(dim=spatial_dims)
@@ -455,13 +492,28 @@ def _masked_soft_dice(
     ) + target.square().sum(dim=spatial_dims)
     score = (numerator + 1.0e-5) / (denominator + 1.0e-5)
     valid_float = valid.to(score.dtype)
+    if label_weights is None:
+        loss_weights = valid_float
+    else:
+        if (
+            label_weights.ndim != 1
+            or label_weights.shape[0] != score.shape[1]
+        ):
+            raise ValueError(
+                "label_weights must contain one positive value per class"
+            )
+        loss_weights = valid_float * label_weights.to(
+            device=score.device,
+            dtype=score.dtype,
+        ).view(1, -1)
     valid_count = valid_float.sum()
+    loss_weight_sum = loss_weights.sum()
     loss = (
-        ((1.0 - score) * valid_float).sum()
-        / valid_count.clamp_min(1.0)
+        ((1.0 - score) * loss_weights).sum()
+        / loss_weight_sum.clamp_min(1.0)
     )
     loss = torch.where(
-        valid_count > 0.0,
+        loss_weight_sum > 0.0,
         loss,
         prediction.sum() * 0.0,
     )
@@ -470,6 +522,59 @@ def _masked_soft_dice(
         / valid_count.clamp_min(1.0)
     )
     return loss, mean_score
+
+
+def _soft_centers(mask: torch.Tensor) -> torch.Tensor:
+    """Return normalized DHW centers for soft masks without a dense grid."""
+    mass = mask.sum(dim=(2, 3, 4)).clamp_min(1.0e-6)
+    centers = []
+    for axis, size in enumerate(mask.shape[2:]):
+        reduce_dims = tuple(
+            dimension
+            for dimension in (2, 3, 4)
+            if dimension != axis + 2
+        )
+        marginal = mask.sum(dim=reduce_dims)
+        coordinate = torch.linspace(
+            -1.0,
+            1.0,
+            int(size),
+            device=mask.device,
+            dtype=mask.dtype,
+        )
+        centers.append(
+            (marginal * coordinate.view(1, 1, -1)).sum(dim=-1)
+            / mass
+        )
+    return torch.stack(centers, dim=-1)
+
+
+def _masked_centroid_distance(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    label_weights: torch.Tensor,
+) -> torch.Tensor:
+    prediction_center = _soft_centers(prediction)
+    target_center = _soft_centers(target)
+    distance = torch.linalg.vector_norm(
+        prediction_center - target_center,
+        dim=-1,
+    ) / float(np.sqrt(12.0))
+    weights = (
+        valid.to(distance.dtype)
+        * label_weights.to(
+            device=distance.device,
+            dtype=distance.dtype,
+        ).view(1, -1)
+    )
+    weight_sum = weights.sum()
+    loss = (distance * weights).sum() / weight_sum.clamp_min(1.0)
+    return torch.where(
+        weight_sum > 0.0,
+        loss,
+        prediction.sum() * 0.0,
+    )
 
 
 def _supervised_anatomy_loss(
@@ -491,6 +596,24 @@ def _supervised_anatomy_loss(
         raise AssertionError(
             "response_valid must have shape [B, number_of_labels]"
         )
+    configured_label_weights = tuple(
+        float(value)
+        for value in config.get(
+            "label_weights",
+            (1.0,) * len(labels),
+        )
+    )
+    if (
+        len(configured_label_weights) != len(labels)
+        or any(value <= 0.0 for value in configured_label_weights)
+    ):
+        raise ValueError(
+            "supervised anatomy label_weights must match labels and be positive"
+        )
+    label_weights = output["flow"].new_tensor(
+        configured_label_weights,
+        dtype=torch.float32,
+    )
     moving_one_hot = torch.cat(
         [(moving_seg == label).float() for label in labels],
         dim=1,
@@ -500,7 +623,14 @@ def _supervised_anatomy_loss(
         dim=1,
     )
     stage_flows = list(output.get("pyramid_flow", ()))
-    flows = stage_flows + [output["flow"]]
+    if (
+        stage_flows
+        and tuple(stage_flows[-1].shape[2:])
+        == tuple(output["flow"].shape[2:])
+    ):
+        flows = stage_flows
+    else:
+        flows = stage_flows + [output["flow"]]
     configured_weights = tuple(
         float(value)
         for value in config.get(
@@ -545,6 +675,7 @@ def _supervised_anatomy_loss(
             warped,
             fixed_scale,
             valid,
+            label_weights,
         )
         dice_loss = dice_loss + float(weight) * current_loss
         final_prediction = warped
@@ -557,12 +688,33 @@ def _supervised_anatomy_loss(
         _soft_boundary(final_prediction),
         _soft_boundary(final_target),
         valid,
+        label_weights,
+    )
+    centroid_loss = _masked_centroid_distance(
+        final_prediction,
+        final_target,
+        valid,
+        label_weights,
+    )
+    inverse_prediction = warp_tensor(
+        fixed_one_hot,
+        output["inverse_flow"].float(),
+        padding_mode="zeros",
+    ).clamp(0.0, 1.0)
+    inverse_loss, inverse_score = _masked_soft_dice(
+        inverse_prediction,
+        moving_one_hot,
+        valid,
+        label_weights,
     )
     return {
         "supervised_dice": dice_loss,
         "supervised_boundary": boundary_loss,
+        "supervised_centroid": centroid_loss,
+        "supervised_inverse_dice": inverse_loss,
         "supervised_final_dice": final_score,
         "supervised_final_boundary_dice": boundary_score,
+        "supervised_final_inverse_dice": inverse_score,
         "supervised_valid_classes": valid.float().sum(),
     }
 
@@ -678,10 +830,21 @@ def _train_epoch(
     supervised_boundary_weight = float(
         supervised_anatomy.get("boundary_loss_weight", 0.0)
     )
+    supervised_centroid_weight = float(
+        supervised_anatomy.get("centroid_loss_weight", 0.0)
+    )
+    supervised_inverse_weight = float(
+        supervised_anatomy.get(
+            "inverse_dice_loss_weight",
+            0.0,
+        )
+    )
     if (
         supervised_anatomy_factor < 0.0
         or supervised_dice_weight < 0.0
         or supervised_boundary_weight < 0.0
+        or supervised_centroid_weight < 0.0
+        or supervised_inverse_weight < 0.0
     ):
         raise ValueError("invalid supervised anatomy weights")
     spacing_dhw = getattr(model, "spacing_dhw", None)
@@ -708,7 +871,22 @@ def _train_epoch(
             if supervised_enabled
             else None
         )
-        moving, fixed = _augment_pair(moving, fixed, augmentation)
+        if supervised_enabled:
+            moving, fixed, moving_seg, fixed_seg = (
+                _augment_pair_with_segmentations(
+                    moving,
+                    fixed,
+                    augmentation,
+                    moving_seg,
+                    fixed_seg,
+                )
+            )
+        else:
+            moving, fixed = _augment_pair(
+                moving,
+                fixed,
+                augmentation,
+            )
         target_flow = None
         if (
             synthetic_probability > 0.0
@@ -770,8 +948,11 @@ def _train_epoch(
                 supervised_terms = {
                     "supervised_dice": zero,
                     "supervised_boundary": zero,
+                    "supervised_centroid": zero,
+                    "supervised_inverse_dice": zero,
                     "supervised_final_dice": zero,
                     "supervised_final_boundary_dice": zero,
+                    "supervised_final_inverse_dice": zero,
                     "supervised_valid_classes": zero,
                 }
             terms.update(supervised_terms)
@@ -786,6 +967,10 @@ def _train_epoch(
                     * terms["supervised_dice"]
                     + supervised_boundary_weight
                     * terms["supervised_boundary"]
+                    + supervised_centroid_weight
+                    * terms["supervised_centroid"]
+                    + supervised_inverse_weight
+                    * terms["supervised_inverse_dice"]
                 )
             )
         if not bool(torch.isfinite(terms["total"]).detach()):
@@ -1315,13 +1500,12 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     supervised_enabled = bool(
         supervised_anatomy.get("enabled", False)
     )
-    if supervised_enabled and (
-        float(augmentation.get("reverse_pair_probability", 0.0)) > 0.0
-        or float(augmentation.get("shared_flip_probability", 0.0)) > 0.0
-    ):
+    if supervised_enabled and float(
+        augmentation.get("reverse_pair_probability", 0.0)
+    ) > 0.0:
         raise ValueError(
-            "segmentation-supervised training requires reverse and flip "
-            "augmentation probabilities to be zero"
+            "the longitudinal supervised experiment requires "
+            "reverse_pair_probability=0"
         )
     data_config = dict(config.get("data", {}))
     shape = tuple(int(value) for value in data_config.get("shape_dhw", (128, 160, 160)))
@@ -1708,7 +1892,8 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 "epoch %d complete stage=%s lr=%.3e "
                 "match_temp=%s appearance=%s "
                 "feature_residual=%s sup_factor=%.3f "
-                "train_sup_dice=%.4f train_sup_boundary=%.4f "
+                "train_sup_dice_loss=%.4f train_sup_boundary=%.4f "
+                "train_sup_centroid=%.4f train_sup_inverse=%.4f "
                 "val_ncc=%s "
                 "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
                 "raw_e=%.4f/%.4f/%.4f motion_e=%.4f/%.4f/%.4f "
@@ -1742,6 +1927,18 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     float(
                         train_metrics.get(
                             "supervised_boundary",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "supervised_centroid",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "supervised_inverse_dice",
                             float("nan"),
                         )
                     ),

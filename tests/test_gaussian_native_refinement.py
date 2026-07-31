@@ -40,11 +40,12 @@ class GaussianResidualPyramidTests(unittest.TestCase):
 
     def test_residual_heads_receive_dense_flow_gradient(self):
         pyramid = GaussianGuidedResidualPyramid(
-            factors=(8, 4, 2),
-            channels=(8, 8, 8),
-            blocks_per_stage=1,
-            maximum_residual_vox=(1.0, 1.0, 1.0),
+            factors=(8, 4, 2, 1),
+            channels=(8, 8, 8, 8),
+            blocks_per_stage=(1, 1, 1, 1),
+            maximum_residual_vox=(1.0, 1.0, 1.0, 0.5),
             integration_steps=3,
+            use_gradient_features=True,
         )
         moving = torch.rand(1, 1, 32, 32, 32)
         fixed = torch.rand_like(moving)

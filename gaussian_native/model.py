@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -73,12 +73,13 @@ class GaussianNativeRegistration(nn.Module):
         pair_context_temperature: float = 0.20,
         refinement_factors: Sequence[int] = (8, 4, 2),
         refinement_channels: Sequence[int] = (48, 40, 32),
-        refinement_blocks_per_stage: int = 3,
+        refinement_blocks_per_stage: Union[int, Sequence[int]] = 3,
         refinement_maximum_residual_vox: Sequence[float] = (
             1.5,
             1.0,
             0.75,
         ),
+        refinement_use_gradient_features: bool = False,
         include_identity_candidate: Optional[bool] = None,
         match_evidence_power: float = 1.0,
         direct_displacement_fractions: Sequence[float] = (1.0, 1.0, 1.0),
@@ -101,6 +102,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -113,6 +115,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -123,6 +126,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -133,6 +137,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
@@ -141,6 +146,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         use_residual_pair_motion = self.architecture_revision in {
@@ -148,9 +154,11 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v8",
             "gaussian_native_v9",
             "gaussian_native_v10",
+            "gaussian_native_v11",
         }
         use_pyramid_refinement = (
-            self.architecture_revision == "gaussian_native_v10"
+            self.architecture_revision
+            in {"gaussian_native_v10", "gaussian_native_v11"}
         )
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
@@ -284,6 +292,9 @@ class GaussianNativeRegistration(nn.Module):
                     refinement_maximum_residual_vox
                 ),
                 integration_steps=integration_steps,
+                use_gradient_features=(
+                    refinement_use_gradient_features
+                ),
             )
             if use_pyramid_refinement
             else None

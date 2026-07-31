@@ -29,7 +29,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v10_hntsmrg24.json",
+        default="configs/gaussian_native_v11_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -184,6 +184,20 @@ def main() -> None:
                         )
                     )
                     * terms["supervised_boundary"]
+                    + float(
+                        supervised_config.get(
+                            "centroid_loss_weight",
+                            0.0,
+                        )
+                    )
+                    * terms["supervised_centroid"]
+                    + float(
+                        supervised_config.get(
+                            "inverse_dice_loss_weight",
+                            0.0,
+                        )
+                    )
+                    * terms["supervised_inverse_dice"]
                 )
             )
     terms["total"].backward()

@@ -14,8 +14,9 @@ for:
 
 The new model has no SACB, Gaussian/dense gate, or learned confidence module.
 Revision v10 adds a three-stage voxel CNN that predicts bounded residual
-stationary velocities after each coarse-to-fine image warp. v10 is therefore a
-Gaussian-guided hybrid registration model; v9 remains the strict
+stationary velocities after each coarse-to-fine image warp. V11 adds a
+gradient-aware fourth stage at full resolution. These revisions are
+Gaussian-guided hybrid registration models; v9 remains the strict
 Gaussian-only ablation.
 
 ## 2. Coordinate convention
@@ -299,7 +300,31 @@ levels. Residual bounds are 1.5, 1.0, and 0.75 voxels at factors 8, 4, and 2.
 Each residual output convolution is initialized to zero, so v10 starts from
 the Gaussian deformation rather than an unrelated dense field.
 
-### 4.5 Diffeomorphic integration
+### 4.5 V11 gradient-aware full-resolution refinement
+
+V11 appends a factor-one residual stage without inventing a fourth Gaussian
+level. The first three stages still receive the root/middle/fine Gaussian
+velocity components; the fourth stage refines their accumulated stationary
+velocity. Its input adds fixed and warped-moving forward-difference gradient
+magnitudes:
+
+\[
+x_1 = \left[
+I^F,\,
+I^M\circ\exp(v_2),\,
+I^F-I^M\circ\exp(v_2),\,
+\exp(v_2),\,
+\|\nabla I^F\|,\,
+\|\nabla(I^M\circ\exp(v_2))\|
+\right].
+\]
+
+The factor-one stage has 16 channels, two residual blocks, and a 0.35-voxel
+velocity bound. Its output head is zero-initialized. Therefore adding the stage
+does not perturb the initial v10 deformation, while training can learn
+sub-voxel boundary corrections that are not representable at factor two.
+
+### 4.6 Diffeomorphic integration
 
 The physical velocity is converted to DHW voxel units and integrated using
 seven scaling-and-squaring steps:
@@ -311,7 +336,8 @@ seven scaling-and-squaring steps:
 The model returns both forward and inverse flows. Through revision v9, no
 learned operation follows Gaussian velocity synthesis. In v10, the accumulated
 factor-two stationary velocity is physically upsampled to full resolution and
-then integrated.
+then integrated. In v11, the factor-one residual is added before the final
+integration.
 
 ## 5. Training objective
 
@@ -379,7 +405,15 @@ zero loss. A final soft-boundary Dice term receives weight 0.2. The combined
 anatomy factor ramps from 0.2 to 1.0 over 15 epochs. This setting is
 segmentation-supervised and must not be compared as if it were unsupervised.
 
-## 6. V10 experimental configuration
+Revision v11 retains response-aware masking but weights GTVp/GTVn losses
+1.5/1.0 based on the measured small-target failure. The factor-8/4/2/1 Dice
+weights are 0.10/0.15/0.25/0.50. In addition to forward Dice and boundary Dice,
+the objective includes normalized soft-centroid distance and final inverse
+Dice with weights 0.15 and 0.20. Synchronized left-right flipping transforms
+both images and both segmentations; longitudinal pair reversal remains
+disabled.
+
+## 6. V11 experimental configuration
 
 - Input: `128×160×160`, 1.5 mm isotropic.
 - Gaussian counts: `64/256/1024`.
@@ -400,16 +434,20 @@ segmentation-supervised and must not be compared as if it were unsupervised.
 - Direct residual fractions: 0.45/0.70/0.60 for root/middle/fine levels.
 - Match-evidence power: 0.5.
 - Local samples: `3×3×3` per primitive.
-- Residual image pyramid: factors 8/4/2, channels 48/40/32, three residual
-  blocks per stage.
-- Residual velocity limits: 1.5/1.0/0.75 stage voxels.
+- Residual image pyramid: factors 8/4/2/1, channels 48/40/32/16, block counts
+  3/3/3/2.
+- Residual velocity limits: 1.5/1.0/0.75/0.35 stage voxels.
+- Gradient-magnitude features: enabled for residual refinement.
 - Integration steps: 7.
-- Trainable parameters: 5,341,667.
+- Trainable parameters: 5,380,790.
+- Production-shape peak A100 allocation: approximately 10.2 GiB.
 - Training autocast: bfloat16.
-- Response-aware GTV soft Dice plus final boundary Dice supervision.
+- Response-aware GTVp-weighted Dice, boundary, centroid, and inverse Dice.
 - Anatomy-supervision ramp: 15 epochs.
+- Shared left-right image/label flip probability: 0.5.
 - Synthetic-deformation training: disabled.
 - Learning-rate warmup: 5 epochs.
+- Training epochs: 150.
 - AMP weight cache: disabled to preserve gradients across no-gradient
   fixed-to-fixed calibration and trainable fixed-to-moving matching.
 - Geometry, transport, rasterization, integration, and NCC: float32.
@@ -421,7 +459,8 @@ Main comparison:
 - original SACB-Net;
 - strongest retained historical result reported from its archived metrics;
 - strict Gaussian-only v9 model;
-- segmentation-supervised Gaussian-guided v10 model.
+- segmentation-supervised Gaussian-guided v10 model;
+- small-target-refined Gaussian-guided v11 model.
 
 Required ablations:
 
@@ -437,6 +476,9 @@ Required ablations:
 - Gaussian-only synthesis versus Gaussian-guided residual pyramid;
 - v10 without label supervision versus Dice only versus Dice plus boundary;
 - shallow versus three-stage residual refinement.
+- v11 without factor-one refinement;
+- v11 without GTVp label weighting;
+- v11 without centroid/inverse supervision.
 
 The implementation exposes `model.motion_mode` (`translation`, `se3`, or
 `affine`), `model.integration_mode` (`direct` or `svf`), and a zero
