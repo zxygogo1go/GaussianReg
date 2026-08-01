@@ -29,7 +29,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v11_hntsmrg24.json",
+        default="configs/gaussian_native_v12_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -267,6 +267,11 @@ def main() -> None:
                     "context_attention_concentration_",
                     "row_max_probability_",
                     "support_size_",
+                    "matched_mass_",
+                    "real_transport_mass_",
+                    "unmatched_fixed_mass_",
+                    "unmatched_moving_mass_",
+                    "marginal_error_",
                     "diagonal_probability_",
                     "transport_delta_",
                     "direct_translation_",

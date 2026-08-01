@@ -36,6 +36,7 @@ class PartialSinkhornMatcher(nn.Module):
         pair_score_heads: int = 4,
         pair_fusion_hidden_dim: Optional[int] = None,
         pair_context_temperature: float = 0.20,
+        marginal_relaxation: float = 1.0,
     ) -> None:
         super().__init__()
         if not 0.0 <= dustbin_mass < 0.5:
@@ -56,10 +57,20 @@ class PartialSinkhornMatcher(nn.Module):
         if not 0.0 <= self.appearance_weight <= 1.0:
             raise ValueError("appearance_weight must lie in [0, 1]")
         self.transport_mode = str(transport_mode).strip().lower()
-        if self.transport_mode not in {"sinkhorn", "row_softmax"}:
-            raise ValueError("transport_mode must be sinkhorn or row_softmax")
+        if self.transport_mode not in {
+            "sinkhorn",
+            "unbalanced_sinkhorn",
+            "row_softmax",
+        }:
+            raise ValueError(
+                "transport_mode must be sinkhorn, unbalanced_sinkhorn, "
+                "or row_softmax"
+            )
         if self.transport_mode == "row_softmax" and self.dustbin_mass:
             raise ValueError("row_softmax requires dustbin_mass=0")
+        self.marginal_relaxation = float(marginal_relaxation)
+        if not 0.0 < self.marginal_relaxation <= 1.0:
+            raise ValueError("marginal_relaxation must lie in (0, 1]")
         self.score_mode = str(score_mode).strip().lower()
         if self.score_mode not in {
             "convex",
@@ -240,6 +251,69 @@ class PartialSinkhornMatcher(nn.Module):
             log_v = log_b - torch.logsumexp(augmented + log_u.unsqueeze(2), dim=1)
         return augmented + log_u.unsqueeze(2) + log_v.unsqueeze(1)
 
+    def _log_unbalanced_transport(
+        self,
+        logits: torch.Tensor,
+        fixed_mass: torch.Tensor,
+        moving_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        """Relax both transport marginals while retaining an unmatched dustbin.
+
+        ``marginal_relaxation=1`` recovers balanced Sinkhorn. Values below one
+        implement the KL-relaxed Sinkhorn updates used by unbalanced optimal
+        transport. The final global normalization keeps the plan scale stable
+        for downstream hierarchy losses while leaving row and column marginals
+        free to depart from the prescribed Gaussian masses.
+        """
+        batch, fixed_nodes, moving_nodes = logits.shape
+        augmented = self.dustbin_score.to(
+            device=logits.device,
+            dtype=logits.dtype,
+        ).expand(batch, fixed_nodes + 1, moving_nodes + 1).clone()
+        augmented[:, :fixed_nodes, :moving_nodes] = logits
+        augmented[:, -1, -1] = 0.0
+        real_fraction = 1.0 - self.dustbin_mass
+        fixed_marginal = torch.cat(
+            (
+                real_fraction * fixed_mass,
+                fixed_mass.new_full((batch, 1), self.dustbin_mass),
+            ),
+            dim=1,
+        )
+        moving_marginal = torch.cat(
+            (
+                real_fraction * moving_mass,
+                moving_mass.new_full((batch, 1), self.dustbin_mass),
+            ),
+            dim=1,
+        )
+        log_a = torch.log(fixed_marginal.clamp_min(1.0e-8))
+        log_b = torch.log(moving_marginal.clamp_min(1.0e-8))
+        log_u = torch.zeros_like(log_a)
+        log_v = torch.zeros_like(log_b)
+        relaxation = self.marginal_relaxation
+        for _ in range(self.iterations):
+            log_u = relaxation * (
+                log_a
+                - torch.logsumexp(
+                    augmented + log_v.unsqueeze(1),
+                    dim=2,
+                )
+            )
+            log_v = relaxation * (
+                log_b
+                - torch.logsumexp(
+                    augmented + log_u.unsqueeze(2),
+                    dim=1,
+                )
+            )
+        log_plan = augmented + log_u.unsqueeze(2) + log_v.unsqueeze(1)
+        log_total = torch.logsumexp(
+            log_plan.flatten(1),
+            dim=1,
+        ).view(batch, 1, 1)
+        return log_plan - log_total
+
     @staticmethod
     def _standardized_appearance(level: GaussianLevel) -> torch.Tensor:
         """Return a fixed, per-volume normalized Gaussian appearance descriptor."""
@@ -261,6 +335,14 @@ class PartialSinkhornMatcher(nn.Module):
         if self.transport_mode == "sinkhorn":
             return torch.exp(
                 self._log_transport(
+                    logits.float(),
+                    fixed_mass.float(),
+                    moving_mass.float(),
+                )
+            )
+        if self.transport_mode == "unbalanced_sinkhorn":
+            return torch.exp(
+                self._log_unbalanced_transport(
                     logits.float(),
                     fixed_mass.float(),
                     moving_mass.float(),
@@ -610,7 +692,16 @@ class PartialSinkhornMatcher(nn.Module):
             support_entropy,
             torch.zeros_like(support_entropy),
         ).clamp(0.0, 1.0)
-        match_evidence = (1.0 - support_entropy).clamp(0.0, 1.0)
+        nominal_fixed_mass = (
+            (1.0 - self.dustbin_mass) * fixed.mass.float()
+        ).clamp_min(1.0e-8)
+        matched_mass_fraction = (
+            plan.sum(dim=2) / nominal_fixed_mass
+        ).clamp(0.0, 1.0)
+        match_evidence = (
+            (1.0 - support_entropy).clamp(0.0, 1.0)
+            * matched_mass_fraction
+        )
         matched_center = torch.einsum(
             "bij,bjd->bid",
             selected_row_plan,
@@ -646,11 +737,32 @@ class PartialSinkhornMatcher(nn.Module):
             selected_row_plan,
             reverse_center,
         )
-        cycle_error = (
+        cycle_error_per_node = (
             (cycle_center - fixed_coordinate)
             / extent_mm.unsqueeze(1).clamp_min(1.0e-6)
         ).square().sum(dim=-1)
+        if self.transport_mode == "row_softmax":
+            cycle_error = cycle_error_per_node.mean()
+        else:
+            cycle_error = (
+                cycle_error_per_node * matched_mass_fraction
+            ).sum() / matched_mass_fraction.sum().clamp_min(1.0e-8)
         transport_cost = (plan * cost.float()).sum() / plan.sum().clamp_min(1.0e-8)
+        real_transport_mass = plan.sum(dim=(1, 2))
+        unmatched_fixed_mass = full_plan[:, :-1, -1].sum(dim=1)
+        unmatched_moving_mass = full_plan[:, -1, :-1].sum(dim=1)
+        target_fixed_real = (
+            (1.0 - self.dustbin_mass) * fixed.mass.float()
+        )
+        target_moving_real = (
+            (1.0 - self.dustbin_mass) * moving.mass.float()
+        )
+        row_marginal_error = (
+            plan.sum(dim=2) - target_fixed_real
+        ).abs().mean(dim=1)
+        column_marginal_error = (
+            plan.sum(dim=1) - target_moving_real
+        ).abs().mean(dim=1)
         return {
             "plan": plan,
             "motion_plan": mutual_affinity if self.mutual_transport else plan,
@@ -674,10 +786,12 @@ class PartialSinkhornMatcher(nn.Module):
             "support_entropy": support_entropy,
             "match_evidence": match_evidence,
             "support_size": support_size,
-            "matched_mass_fraction": (
-                plan.sum(dim=2)
-                / ((1.0 - self.dustbin_mass) * fixed.mass.float()).clamp_min(1.0e-8)
-            ).clamp(0.0, 1.0),
+            "matched_mass_fraction": matched_mass_fraction,
+            "real_transport_mass": real_transport_mass,
+            "unmatched_fixed_mass": unmatched_fixed_mass,
+            "unmatched_moving_mass": unmatched_moving_mass,
+            "marginal_error": 0.5
+            * (row_marginal_error + column_marginal_error),
         }
 
 
@@ -709,6 +823,7 @@ class HierarchicalGaussianCorrespondence(nn.Module):
         pair_score_heads: int = 4,
         pair_fusion_hidden_dim: Optional[int] = None,
         pair_context_temperature: float = 0.20,
+        marginal_relaxation: float = 1.0,
     ) -> None:
         super().__init__()
         self.parent_candidates = int(parent_candidates)
@@ -742,6 +857,7 @@ class HierarchicalGaussianCorrespondence(nn.Module):
                     pair_score_heads=pair_score_heads,
                     pair_fusion_hidden_dim=pair_fusion_hidden_dim,
                     pair_context_temperature=pair_context_temperature,
+                    marginal_relaxation=marginal_relaxation,
                 )
                 for _ in range(3)
             ]

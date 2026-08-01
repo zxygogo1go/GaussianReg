@@ -109,6 +109,21 @@ class GaussianNativeObjective(nn.Module):
             raise ValueError("anchor_offset_weight must be nonnegative")
         self.cycle_weight = float(config.get("cycle_weight", 0.50))
         self.hierarchy_weight = float(config.get("hierarchy_weight", 0.50))
+        self.partial_mass_weight = float(
+            config.get("partial_mass_weight", 0.0)
+        )
+        self.marginal_consistency_weight = float(
+            config.get("marginal_consistency_weight", 0.0)
+        )
+        self.minimum_real_transport_mass = float(
+            config.get("minimum_real_transport_mass", 0.0)
+        )
+        if (
+            self.partial_mass_weight < 0.0
+            or self.marginal_consistency_weight < 0.0
+            or not 0.0 <= self.minimum_real_transport_mass <= 1.0
+        ):
+            raise ValueError("invalid partial transport loss configuration")
         self.inverse_weight = float(config.get("inverse_weight", 0.50))
         self.jacobian_weight = float(config.get("jacobian_weight", 0.20))
         self.velocity_energy_weight = float(config.get("velocity_energy_weight", 0.01))
@@ -223,7 +238,24 @@ class GaussianNativeObjective(nn.Module):
         hierarchy = sum(result["hierarchy_error"] for result in results[1:]) / float(
             max(len(results) - 1, 1)
         )
-        return transport + self.cycle_weight * cycle + self.hierarchy_weight * hierarchy
+        partial_mass = sum(
+            F.relu(
+                self.minimum_real_transport_mass
+                - result["real_transport_mass"].float()
+            ).square().mean()
+            for result in results
+        ) / float(len(results))
+        marginal_consistency = sum(
+            result["marginal_error"].float().mean()
+            for result in results
+        ) / float(len(results))
+        return (
+            transport
+            + self.cycle_weight * cycle
+            + self.hierarchy_weight * hierarchy
+            + self.partial_mass_weight * partial_mass
+            + self.marginal_consistency_weight * marginal_consistency
+        )
 
     def _motion_hierarchy(self, output: Mapping[str, object]) -> torch.Tensor:
         """Softly centre additive child residuals without cancelling them."""

@@ -413,7 +413,23 @@ Dice with weights 0.15 and 0.20. Synchronized left-right flipping transforms
 both images and both segmentations; longitudinal pair reversal remains
 disabled.
 
-## 6. V11 experimental configuration
+Revision v12 addresses forced correspondence and late supervised overfitting.
+For each level it solves a bidirectional, KL-relaxed Sinkhorn problem over the
+real Gaussian nodes plus an unmatched dustbin. The relaxed plan may depart from
+the prescribed row and column marginals. A Gaussian's motion evidence is its
+support concentration multiplied by its transported real-mass fraction; a
+sharp match with negligible transported mass therefore cannot create a strong
+velocity. The implementation reports real transport mass, unmatched mass in
+both directions, and marginal error.
+
+V12 also uses a Gaussian-first curriculum. Epochs 1--15 contain only synthetic
+pairs with exact dense and Gaussian displacement supervision. The
+zero-initialized residual image pyramid is frozen through epoch 20. Real-pair
+anatomy supervision starts at epoch 31 and ramps only from 0.05 to 0.40, while
+moving and fixed intensities are augmented independently. This curriculum is a
+training strategy, not a third prediction module.
+
+## 6. V11/V12 experimental configuration
 
 - Input: `128×160×160`, 1.5 mm isotropic.
 - Gaussian counts: `64/256/1024`.
@@ -452,6 +468,12 @@ disabled.
   fixed-to-fixed calibration and trainable fixed-to-moving matching.
 - Geometry, transport, rasterization, integration, and NCC: float32.
 
+V12 changes only the matching and training protocol needed for a controlled
+comparison: transport is bidirectional unbalanced Sinkhorn with dustbin mass
+0.18, marginal relaxation 0.90, and 16 iterations. It uses the 15/20/31 epoch
+synthetic-pretrain/refinement-unfreeze/anatomy-start boundaries described above;
+the architecture width and four-stage refinement capacity remain unchanged.
+
 ## 7. Required comparisons and ablations
 
 Main comparison:
@@ -461,6 +483,7 @@ Main comparison:
 - strict Gaussian-only v9 model;
 - segmentation-supervised Gaussian-guided v10 model;
 - small-target-refined Gaussian-guided v11 model.
+- partial-correspondence Gaussian-first v12 model.
 
 Required ablations:
 
@@ -479,6 +502,9 @@ Required ablations:
 - v11 without factor-one refinement;
 - v11 without GTVp label weighting;
 - v11 without centroid/inverse supervision.
+- v12 forced row-softmax versus partial Sinkhorn;
+- v12 without synthetic Gaussian pretraining;
+- v12 without delayed weak anatomy supervision.
 
 The implementation exposes `model.motion_mode` (`translation`, `se3`, or
 `affine`), `model.integration_mode` (`direct` or `svf`), and a zero

@@ -238,6 +238,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v9",
         "gaussian_native_v10",
         "gaussian_native_v11",
+        "gaussian_native_v12",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -310,6 +311,14 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         ),
         pair_context_temperature=float(
             model.get("pair_context_temperature", 0.20)
+        ),
+        marginal_relaxation=float(
+            model.get("marginal_relaxation", 1.0)
+        ),
+        mutual_transport=(
+            None
+            if "mutual_transport" not in model
+            else bool(model["mutual_transport"])
         ),
         refinement_factors=tuple(
             int(value)
@@ -507,6 +516,16 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
         diagnostics["matched_mass_l%d" % index] = float(
             result["matched_mass_fraction"].detach().float().mean().cpu()
         )
+        for key, prefix in (
+            ("real_transport_mass", "real_transport_mass"),
+            ("unmatched_fixed_mass", "unmatched_fixed_mass"),
+            ("unmatched_moving_mass", "unmatched_moving_mass"),
+            ("marginal_error", "marginal_error"),
+        ):
+            if key in result:
+                diagnostics["%s_l%d" % (prefix, index)] = float(
+                    result[key].detach().float().mean().cpu()
+                )
         diagnostics["mutual_concentration_l%d" % index] = float(
             result["mutual_concentration"].detach().float().cpu()
         )

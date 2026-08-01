@@ -71,6 +71,8 @@ class GaussianNativeRegistration(nn.Module):
         pair_score_heads: int = 4,
         pair_fusion_hidden_dim: Optional[int] = None,
         pair_context_temperature: float = 0.20,
+        marginal_relaxation: float = 1.0,
+        mutual_transport: Optional[bool] = None,
         refinement_factors: Sequence[int] = (8, 4, 2),
         refinement_channels: Sequence[int] = (48, 40, 32),
         refinement_blocks_per_stage: Union[int, Sequence[int]] = 3,
@@ -103,6 +105,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -116,6 +119,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -127,6 +131,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -138,6 +143,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
@@ -147,6 +153,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         use_residual_pair_motion = self.architecture_revision in {
@@ -155,11 +162,23 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v9",
             "gaussian_native_v10",
             "gaussian_native_v11",
+            "gaussian_native_v12",
         }
         use_pyramid_refinement = (
             self.architecture_revision
-            in {"gaussian_native_v10", "gaussian_native_v11"}
+            in {
+                "gaussian_native_v10",
+                "gaussian_native_v11",
+                "gaussian_native_v12",
+            }
         )
+        use_bidirectional_partial_transport = (
+            self.architecture_revision == "gaussian_native_v12"
+        )
+        if mutual_transport is None:
+            mutual_transport = (
+                use_v3_motion or use_bidirectional_partial_transport
+            )
         if include_identity_candidate is None:
             include_identity_candidate = use_v5_motion
         rotation_limit = (
@@ -225,7 +244,7 @@ class GaussianNativeRegistration(nn.Module):
                 if use_v3_motion or use_residual_pair_motion
                 else "learned"
             ),
-            mutual_transport=use_v3_motion,
+            mutual_transport=bool(mutual_transport),
             detach_geometry_cost=use_anatomical_motion,
             appearance_weight=(
                 appearance_weight if use_sparse_appearance_motion else 0.0
@@ -255,6 +274,7 @@ class GaussianNativeRegistration(nn.Module):
             pair_score_heads=pair_score_heads,
             pair_fusion_hidden_dim=pair_fusion_hidden_dim,
             pair_context_temperature=pair_context_temperature,
+            marginal_relaxation=marginal_relaxation,
         )
         self.velocity_head = GaussianVelocityHead(
             feature_dim=feature_dim,

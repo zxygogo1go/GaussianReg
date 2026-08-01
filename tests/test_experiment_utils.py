@@ -650,6 +650,116 @@ class ExperimentUtilityTests(unittest.TestCase):
             (32, 32, 32),
         )
 
+    def test_v12_builder_and_gaussian_first_curriculum(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v12",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 4,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "unbalanced_sinkhorn",
+                "marginal_relaxation": 0.9,
+                "mutual_transport": True,
+                "correspondence_score_mode": "contextual_residual",
+                "appearance_weight": 0.8,
+                "feature_residual_weight": 0.1,
+                "pair_score_hidden_dim": 32,
+                "pair_context_dim": 32,
+                "pair_score_heads": 4,
+                "pair_fusion_hidden_dim": 48,
+                "dustbin_mass": 0.18,
+                "motion_mode": "translation",
+                "refinement_factors": [8, 4, 2, 1],
+                "refinement_channels": [8, 8, 8, 8],
+                "refinement_blocks_per_stage": [1, 1, 1, 1],
+                "refinement_maximum_residual_vox": [
+                    1.0,
+                    1.0,
+                    1.0,
+                    0.5,
+                ],
+            },
+            "synthetic_deformation": {
+                "enabled": True,
+                "warmup_epochs": 2,
+                "probability_after_warmup": 0.25,
+                "active_until_epoch": 4,
+            },
+            "supervised_anatomy": {
+                "enabled": True,
+                "start_epoch": 3,
+                "weight_factor_start": 0.05,
+                "weight_factor_end": 0.4,
+                "weight_ramp_epochs": 3,
+            },
+            "optimization": {
+                "gaussian_pretrain_epochs": 2,
+                "freeze_refinement_during_gaussian_pretrain": True,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(
+            model.architecture_revision,
+            "gaussian_native_v12",
+        )
+        for matcher in model.correspondence.matchers:
+            self.assertEqual(
+                matcher.transport_mode,
+                "unbalanced_sinkhorn",
+            )
+            self.assertAlmostEqual(matcher.marginal_relaxation, 0.9)
+            self.assertTrue(matcher.mutual_transport)
+
+        pretrain = _configure_training_stage(model, config, 1)
+        self.assertEqual(
+            pretrain["name"],
+            "gaussian_synthetic_pretrain",
+        )
+        self.assertFalse(pretrain["refinement_trainable"])
+        self.assertEqual(pretrain["supervised_anatomy_factor"], 0.0)
+        self.assertFalse(
+            any(
+                parameter.requires_grad
+                for parameter in model.residual_pyramid.parameters()
+            )
+        )
+
+        joint = _configure_training_stage(model, config, 3)
+        self.assertEqual(
+            joint["name"],
+            "joint_with_synthetic_deformation",
+        )
+        self.assertTrue(joint["refinement_trainable"])
+        self.assertAlmostEqual(joint["supervised_anatomy_factor"], 0.05)
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.residual_pyramid.parameters()
+            )
+        )
+        self.assertAlmostEqual(
+            _supervised_anatomy_factor(
+                config["supervised_anatomy"],
+                5,
+            ),
+            0.4,
+        )
+
     def test_correspondence_temperature_schedule_boundaries(self):
         config = {
             "model": {

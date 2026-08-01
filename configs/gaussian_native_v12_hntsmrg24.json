@@ -1,0 +1,265 @@
+{
+  "schema_version": 12,
+  "experiment_name": "gaussian_native_v12_hntsmrg24",
+  "seed": 2026,
+  "data": {
+    "cohort": "HNTS-MRG24 longitudinal T2",
+    "shape_dhw": [
+      128,
+      160,
+      160
+    ],
+    "spacing_dhw": [
+      1.5,
+      1.5,
+      1.5
+    ],
+    "moving_timepoint": "raw preRT after rigid/affine prealignment",
+    "fixed_timepoint": "midRT",
+    "labels_for_training": true,
+    "supervision_protocol": "delayed weak response-aware GTV supervision after Gaussian-first pretraining"
+  },
+  "model": {
+    "architecture": "gaussian_native",
+    "architecture_revision": "gaussian_native_v12",
+    "root_grid_shape": [
+      4,
+      4,
+      4
+    ],
+    "children_per_parent": 4,
+    "gaussian_counts": [
+      64,
+      256,
+      1024
+    ],
+    "feature_dim": 160,
+    "hidden_dim": 224,
+    "graph_heads": 8,
+    "graph_neighbors": 20,
+    "graph_blocks_per_level": 3,
+    "samples_per_axis": 3,
+    "pyramid_factors": [
+      16,
+      8,
+      4
+    ],
+    "geometry_mode": "anchored",
+    "sinkhorn_iterations": 16,
+    "transport_mode": "unbalanced_sinkhorn",
+    "marginal_relaxation": 0.9,
+    "mutual_transport": true,
+    "correspondence_score_mode": "contextual_residual",
+    "appearance_weight": 0.85,
+    "appearance_weight_end": 0.5,
+    "appearance_weight_anneal_epochs": 70,
+    "feature_residual_weight": 0.05,
+    "feature_residual_weight_end": 0.35,
+    "feature_residual_weight_anneal_epochs": 70,
+    "max_feature_residual_logit": 1.5,
+    "pair_score_hidden_dim": 160,
+    "pair_context_dim": 256,
+    "pair_score_heads": 8,
+    "pair_fusion_hidden_dim": 320,
+    "pair_context_temperature": 0.22,
+    "match_temperature": 0.18,
+    "match_temperature_end": 0.1,
+    "match_temperature_anneal_epochs": 80,
+    "position_weight": 0.03,
+    "scale_weight": 0.02,
+    "dustbin_mass": 0.18,
+    "parent_candidates": 12,
+    "include_identity_candidate": false,
+    "match_evidence_power": 0.5,
+    "velocity_hidden_dim": 320,
+    "direct_displacement_fractions": [
+      0.45,
+      0.7,
+      0.6
+    ],
+    "direct_displacement_limits_mm": [
+      8.0,
+      5.0,
+      3.0
+    ],
+    "learned_translation_fractions": [
+      0.25,
+      0.2,
+      0.15
+    ],
+    "max_rotation_radians": 0.0,
+    "max_strain": 0.0,
+    "raster_chunk": 64,
+    "cutoff_sigma": 3.5,
+    "integration_steps": 7,
+    "motion_mode": "translation",
+    "integration_mode": "svf",
+    "covariance_mode": "full",
+    "refinement_factors": [
+      8,
+      4,
+      2,
+      1
+    ],
+    "refinement_channels": [
+      48,
+      40,
+      32,
+      16
+    ],
+    "refinement_blocks_per_stage": [
+      3,
+      3,
+      3,
+      2
+    ],
+    "refinement_maximum_residual_vox": [
+      1.5,
+      1.0,
+      0.75,
+      0.35
+    ],
+    "refinement_use_gradient_features": true
+  },
+  "loss": {
+    "similarity": 1.0,
+    "representation": 0.02,
+    "correspondence": 0.02,
+    "deformation": 0.05,
+    "ncc_window": 9,
+    "ngf_weight": 0.05,
+    "coverage_weight": 0.1,
+    "containment_weight": 0.1,
+    "anchor_offset_weight": 0.0,
+    "cycle_weight": 0.25,
+    "hierarchy_weight": 0.25,
+    "partial_mass_weight": 0.25,
+    "marginal_consistency_weight": 0.05,
+    "minimum_real_transport_mass": 0.55,
+    "inverse_weight": 0.25,
+    "jacobian_weight": 0.75,
+    "velocity_energy_weight": 0.001,
+    "motion_hierarchy_weight": 0.0,
+    "jacobian_margin": 0.05
+  },
+  "synthetic_deformation": {
+    "enabled": true,
+    "warmup_epochs": 15,
+    "probability_after_warmup": 0.35,
+    "active_until_epoch": 45,
+    "control_grid_shape": [
+      5,
+      6,
+      6
+    ],
+    "local_velocity_mm_range": [
+      1.5,
+      6.0
+    ],
+    "translation_velocity_mm_range": [
+      0.0,
+      4.0
+    ],
+    "integration_steps": 7,
+    "flow_loss_weight": 1.0,
+    "correspondence_loss_weight": 0.75
+  },
+  "supervised_anatomy": {
+    "enabled": true,
+    "labels": [
+      1,
+      2
+    ],
+    "label_weights": [
+      1.5,
+      1.0
+    ],
+    "dice_loss_weight": 1.0,
+    "boundary_loss_weight": 0.2,
+    "centroid_loss_weight": 0.1,
+    "inverse_dice_loss_weight": 0.15,
+    "start_epoch": 31,
+    "weight_factor_start": 0.05,
+    "weight_factor_end": 0.4,
+    "weight_ramp_epochs": 20,
+    "deep_supervision_weights": [
+      0.1,
+      0.15,
+      0.25,
+      0.5
+    ]
+  },
+  "augmentation": {
+    "enabled": true,
+    "reverse_pair_probability": 0.0,
+    "shared_flip_probability": 0.5,
+    "intensity_probability": 0.9,
+    "intensity_pair_mode": "independent",
+    "gamma_range": [
+      0.85,
+      1.15
+    ],
+    "scale_range": [
+      0.9,
+      1.1
+    ],
+    "shift_range": [
+      -0.08,
+      0.08
+    ],
+    "noise_std_range": [
+      0.0,
+      0.015
+    ]
+  },
+  "optimization": {
+    "epochs": 150,
+    "batch_size": 1,
+    "workers": 4,
+    "learning_rate": 6e-05,
+    "weight_decay": 2e-05,
+    "warmup_epochs": 5,
+    "gaussian_pretrain_epochs": 20,
+    "freeze_refinement_during_gaussian_pretrain": true,
+    "correspondence_warmup_epochs": 0,
+    "freeze_velocity_head_during_correspondence_warmup": false,
+    "minimum_lr_factor": 0.05,
+    "gradient_clip": 3.0,
+    "amp": true,
+    "amp_dtype": "bfloat16",
+    "amp_cache_enabled": false,
+    "allow_tf32": true,
+    "validate_every": 1,
+    "checkpoint_every": 10,
+    "log_every": 10
+  },
+  "monitoring": {
+    "selection_metric": "mean_dice",
+    "fail_fast_enabled": true,
+    "fail_fast_start_epoch": 20,
+    "fail_fast_patience": 3,
+    "recent_mean_ncc_floor": -0.02,
+    "recent_mean_dice_floor": -0.03,
+    "maximum_negative_jacobian_ratio": 0.02,
+    "maximum_anchor_offset_l2": 0.0001,
+    "best_checkpoint_maximum_negative_jacobian_ratio": 0.01,
+    "best_checkpoint_minimum_ncc_improvement": -0.005,
+    "best_checkpoint_minimum_dice_improvement": 0.0,
+    "uniform_entropy_threshold": 0.985,
+    "uniform_row_maximum_threshold": 0.04,
+    "progress_thresholds": [
+      {
+        "epoch": 30,
+        "minimum_best_dice_improvement": 0.01
+      },
+      {
+        "epoch": 60,
+        "minimum_best_dice_improvement": 0.035
+      },
+      {
+        "epoch": 100,
+        "minimum_best_dice_improvement": 0.05
+      }
+    ]
+  }
+}

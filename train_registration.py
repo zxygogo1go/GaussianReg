@@ -448,19 +448,26 @@ def _supervised_anatomy_factor(
         raise ValueError("epoch must be positive")
     if not bool(config.get("enabled", False)):
         return 0.0
+    start_epoch = int(config.get("start_epoch", 1))
     start = float(config.get("weight_factor_start", 0.20))
     end = float(config.get("weight_factor_end", 1.0))
     ramp_epochs = int(config.get("weight_ramp_epochs", 15))
     if (
-        start < 0.0
+        start_epoch <= 0
+        or start < 0.0
         or end < 0.0
         or ramp_epochs <= 0
     ):
         raise ValueError("invalid supervised anatomy schedule")
+    if epoch < start_epoch:
+        return 0.0
     if ramp_epochs == 1:
         return end
     progress = min(
-        max(float(epoch - 1) / float(ramp_epochs - 1), 0.0),
+        max(
+            float(epoch - start_epoch) / float(ramp_epochs - 1),
+            0.0,
+        ),
         1.0,
     )
     return end + 0.5 * (start - end) * (
@@ -750,6 +757,28 @@ def _configure_training_stage(
     if velocity_head is not None:
         for parameter in velocity_head.parameters():
             parameter.requires_grad_(not correspondence_warmup)
+    gaussian_pretrain_epochs = int(
+        optimization.get("gaussian_pretrain_epochs", 0)
+    )
+    if gaussian_pretrain_epochs < 0:
+        raise ValueError(
+            "optimization.gaussian_pretrain_epochs must be nonnegative"
+        )
+    residual_pyramid = getattr(model, "residual_pyramid", None)
+    freeze_refinement = bool(
+        optimization.get(
+            "freeze_refinement_during_gaussian_pretrain",
+            True,
+        )
+    )
+    gaussian_pretrain = bool(
+        residual_pyramid is not None
+        and freeze_refinement
+        and epoch <= gaussian_pretrain_epochs
+    )
+    if residual_pyramid is not None:
+        for parameter in residual_pyramid.parameters():
+            parameter.requires_grad_(not gaussian_pretrain)
     synthetic_probability = _synthetic_deformation_probability(
         dict(config.get("synthetic_deformation", {})),
         epoch,
@@ -758,7 +787,13 @@ def _configure_training_stage(
         dict(config.get("supervised_anatomy", {})),
         epoch,
     )
-    if correspondence_warmup:
+    if gaussian_pretrain and synthetic_probability >= 1.0:
+        stage_name = "gaussian_synthetic_pretrain"
+    elif gaussian_pretrain and synthetic_probability > 0.0:
+        stage_name = "gaussian_mixed_pretrain"
+    elif gaussian_pretrain:
+        stage_name = "gaussian_real_pretrain"
+    elif correspondence_warmup:
         stage_name = "correspondence_warmup"
     elif synthetic_probability >= 1.0:
         stage_name = "synthetic_deformation_warmup"
@@ -771,6 +806,7 @@ def _configure_training_stage(
     return {
         "name": stage_name,
         "velocity_head_trainable": not correspondence_warmup,
+        "refinement_trainable": not gaussian_pretrain,
         "synthetic_deformation_probability": synthetic_probability,
         "supervised_anatomy_factor": anatomy_factor,
         "trainable_parameters": sum(
@@ -1752,6 +1788,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             train_metrics["velocity_head_trainable"] = float(
                 bool(training_stage["velocity_head_trainable"])
             )
+            train_metrics["refinement_trainable"] = float(
+                bool(training_stage["refinement_trainable"])
+            )
             train_metrics["trainable_parameters_epoch"] = float(
                 training_stage["trainable_parameters"]
             )
@@ -1796,6 +1835,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             writer.add_scalar(
                 "optimization/velocity_head_trainable",
                 float(bool(training_stage["velocity_head_trainable"])),
+                epoch,
+            )
+            writer.add_scalar(
+                "optimization/refinement_trainable",
+                float(bool(training_stage["refinement_trainable"])),
                 epoch,
             )
 
@@ -1896,6 +1940,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 "train_sup_centroid=%.4f train_sup_inverse=%.4f "
                 "val_ncc=%s "
                 "val_dice=%s val_p95_mm=%s support_h=%.4f/%.4f/%.4f "
+                "matched_mass=%.4f/%.4f/%.4f "
                 "raw_e=%.4f/%.4f/%.4f motion_e=%.4f/%.4f/%.4f "
                 "diag0=%.4f residual0=%.3f delta0_mm=%.3f anchor2=%.3f "
                 "ncc_gain=%.5f dice_gain=%.5f "
@@ -1966,6 +2011,24 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     float(
                         train_metrics.get(
                             "support_entropy_l2",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "matched_mass_l0",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "matched_mass_l1",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "matched_mass_l2",
                             float("nan"),
                         )
                     ),

@@ -438,6 +438,79 @@ class GaussianNativeCorrespondenceTests(unittest.TestCase):
                 0.0,
             )
 
+    def test_v12_unbalanced_transport_exposes_partial_bidirectional_mass(self):
+        fixed, extent = self._represent(
+            torch.rand(1, 1, 32, 32, 32)
+        )
+        moving, _ = self._represent(
+            torch.rand(1, 1, 32, 32, 32)
+        )
+        matcher = HierarchicalGaussianCorrespondence(
+            feature_dim=24,
+            temperature=0.18,
+            position_weight=0.03,
+            scale_weight=0.02,
+            dustbin_mass=0.18,
+            sinkhorn_iterations=8,
+            parent_candidates=2,
+            identity_calibration=True,
+            coordinate_mode="canonical",
+            mutual_transport=True,
+            detach_geometry_cost=True,
+            appearance_weight=0.8,
+            transport_mode="unbalanced_sinkhorn",
+            score_mode="contextual_residual",
+            feature_residual_weight=0.1,
+            pair_score_hidden_dim=32,
+            pair_context_dim=32,
+            pair_score_heads=4,
+            pair_fusion_hidden_dim=48,
+            marginal_relaxation=0.9,
+        )
+        results = matcher(fixed, moving, extent)
+        for result in results:
+            total = result["full_plan"].sum(dim=(1, 2))
+            self.assertTrue(
+                torch.allclose(
+                    total,
+                    torch.ones_like(total),
+                    atol=1.0e-5,
+                )
+            )
+            self.assertTrue(
+                torch.all(result["real_transport_mass"] > 0.0)
+            )
+            self.assertTrue(
+                torch.all(result["real_transport_mass"] < 1.0)
+            )
+            self.assertGreater(
+                float(result["unmatched_fixed_mass"].sum()),
+                0.0,
+            )
+            self.assertGreater(
+                float(result["unmatched_moving_mass"].sum()),
+                0.0,
+            )
+            self.assertTrue(torch.isfinite(result["marginal_error"]).all())
+            self.assertTrue(torch.all(result["match_evidence"] >= 0.0))
+            self.assertTrue(torch.all(result["match_evidence"] <= 1.0))
+        loss = sum(
+            result["transport_cost"]
+            + result["cycle_error"]
+            + result["marginal_error"].mean()
+            for result in results
+        )
+        loss.backward()
+        gradients = [
+            parameter.grad
+            for parameter in matcher.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertTrue(gradients)
+        self.assertTrue(
+            all(torch.isfinite(gradient).all() for gradient in gradients)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

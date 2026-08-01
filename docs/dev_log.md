@@ -1,5 +1,5 @@
 # Development Log — Gaussian-Native Registration
-> Created: 2026-07-31 | Last updated: 2026-07-31
+> Created: 2026-07-31 | Last updated: 2026-08-01
 > Implementation guide: `docs/implementation.md`
 
 ## Progress
@@ -11,8 +11,27 @@
 | V11 supervision | `train_registration.py` | Done | Loss and synchronized augmentation checks passed |
 | V11 configuration | `configs/gaussian_native_v11_hntsmrg24.json` | Done | 150 epochs; explicit command, no launch script |
 | Verification | unit tests and A100 smoke | Done | 62 tests; production smoke; two real batches |
+| V12 partial transport | `gaussian_native/correspondence.py` | Done | Bidirectional KL-relaxed Sinkhorn with unmatched mass |
+| V12 Gaussian-first curriculum | `train_registration.py` | Done | Synthetic pretrain, delayed refinement and weak labels |
+| V12 configuration | `configs/gaussian_native_v12_hntsmrg24.json` | Done | Explicit command; 64 tests and A100 smoke passed |
 
 ## Log
+
+### 2026-08-01 — V12 partial correspondence and curriculum
+
+- Diagnosed v11 as numerically stable but overfit: best validation Dice was
+  0.61962 at epoch 110, versus 0.61920 at epoch 22, while training Dice rose
+  from 0.744 to 0.884.
+- Replaced production row-softmax with bidirectional KL-relaxed Sinkhorn and an
+  explicit dustbin. Motion evidence now includes actual matched mass.
+- Added real transport mass, fixed/moving unmatched mass, and marginal error
+  diagnostics at every Gaussian level.
+- Added a Gaussian-first schedule: 15 synthetic-only epochs, residual-pyramid
+  freeze through epoch 20, and weak anatomy supervision beginning at epoch 31.
+- Enabled independent moving/fixed intensity augmentation.
+- Passed 64/64 server tests. Production A100 smoke was finite with 5,380,790
+  parameters, 10,539.4 MiB peak allocation, and nonzero gradients in all three
+  contextual pair scorers. Initial real transport mass was 0.688/0.706/0.717.
 
 ### 2026-07-31 — V11 design
 
@@ -84,11 +103,11 @@
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/student3/miniconda3/envs/SACB/bin/python \
   smoke_gaussian_native.py \
-  --config configs/gaussian_native_v11_hntsmrg24.json \
+  --config configs/gaussian_native_v12_hntsmrg24.json \
   --device cuda:0
 ```
 
-- `--config` selects the complete V11 architecture and training objective.
+- `--config` selects the complete V12 architecture and training objective.
 - `--device` selects the visible A100.
 - The command performs one production-shape forward/backward pass and prints
   finiteness, gradients, parameter count, runtime, and peak allocated memory.
@@ -99,13 +118,13 @@ CUDA_VISIBLE_DEVICES=0 /home/student3/miniconda3/envs/SACB/bin/python \
 CUDA_VISIBLE_DEVICES=0 nohup \
   /home/student3/miniconda3/envs/SACB/bin/python \
   train_gaussian_native.py \
-  --config configs/gaussian_native_v11_hntsmrg24.json \
+  --config configs/gaussian_native_v12_hntsmrg24.json \
   --data-root /home/student3/data2t/TouJing/HNTSMRG24_gam_preprocessed \
   --train-manifest /home/student3/data2t/TouJing/HNTSMRG24_gam_preprocessed/manifests/train.csv \
   --validation-manifest /home/student3/data2t/TouJing/HNTSMRG24_gam_preprocessed/manifests/validation.csv \
-  --output-dir /home/student3/data2t/TouJing/GaussianReg/runs/gaussian_native_v11_hntsmrg24_seed2026 \
+  --output-dir /home/student3/data2t/TouJing/GaussianReg/runs/gaussian_native_v12_hntsmrg24_seed2026 \
   --device cuda:0 \
-  > /home/student3/data2t/TouJing/GaussianReg/train_gaussian_native_v11_hntsmrg24_seed2026.log 2>&1 &
+  > /home/student3/data2t/TouJing/GaussianReg/train_gaussian_native_v12_hntsmrg24_seed2026.log 2>&1 &
 ```
 
 - The manifests define the patient-disjoint train/validation split.
