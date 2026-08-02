@@ -87,6 +87,63 @@ class HeadNeckDatasetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_manifest(manifest)
 
+    def test_multichannel_overlapping_masks_are_selected_and_reordered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shape = (8, 8, 8)
+            image = np.zeros(shape, dtype=np.float32)
+            segmentation = np.zeros((3,) + shape, dtype=np.uint8)
+            segmentation[0, 1:5, 1:5, 1:5] = 1
+            segmentation[1, 2:4, 2:4, 2:4] = 1
+            segmentation[2, 5:7, 5:7, 5:7] = 1
+            for name, array in {
+                "moving.npy": image,
+                "fixed.npy": image,
+                "moving_seg.npy": segmentation,
+                "fixed_seg.npy": segmentation,
+            }.items():
+                np.save(str(root / name), array, allow_pickle=False)
+            manifest = root / "manifest.csv"
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "patient_id",
+                        "moving",
+                        "fixed",
+                        "moving_seg",
+                        "fixed_seg",
+                        "segmentation_labels",
+                        "valid_labels",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "patient_id": "a__to__b",
+                        "moving": "moving.npy",
+                        "fixed": "fixed.npy",
+                        "moving_seg": "moving_seg.npy",
+                        "fixed_seg": "fixed_seg.npy",
+                        "segmentation_labels": "3;7;11",
+                        "valid_labels": "3;11",
+                    }
+                )
+            dataset = HeadNeckRegistrationDataset(
+                manifest,
+                root,
+                expected_shape=shape,
+                labels=(11, 3, 7),
+            )
+            sample = dataset[0]
+            self.assertEqual(tuple(sample["moving_seg"].shape), (3,) + shape)
+            self.assertEqual(
+                sample["response_valid"].tolist(),
+                [True, True, False],
+            )
+            self.assertEqual(int(sample["moving_seg"][0].sum()), 8)
+            self.assertEqual(int(sample["moving_seg"][1].sum()), 64)
+
     def test_normalization_and_stratified_split_are_deterministic(self):
         volume = np.arange(1000, dtype=np.float32).reshape(10, 10, 10)
         normalized, metadata = robust_normalize(volume)

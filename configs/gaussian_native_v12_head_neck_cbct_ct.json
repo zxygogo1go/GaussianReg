@@ -1,0 +1,48 @@
+{
+  "extends": "gaussian_native_v12_hntsmrg24.json",
+  "schema_version": 12,
+  "experiment_name": "gaussian_native_v12_head_neck_cbct_ct",
+  "data": {
+    "cohort": "Head-Neck-CBCT-CT paired CBCT-to-CT",
+    "shape_dhw": [128, 160, 160],
+    "spacing_dhw": [1.5, 1.5, 1.5],
+    "moving_timepoint": "CBCT on provided paired voxel grid",
+    "fixed_timepoint": "CT on provided paired voxel grid",
+    "labels_available": false,
+    "labels_for_training": false,
+    "evaluation_labels": [],
+    "supervision_protocol": "fully unsupervised; dataset contains no anatomical labels"
+  },
+  "loss": {
+    "ngf_weight": 0.2,
+    "similarity": 1.0,
+    "representation": 0.02,
+    "correspondence": 0.02,
+    "deformation": 0.08
+  },
+  "supervised_anatomy": {
+    "enabled": false
+  },
+  "augmentation": {
+    "enabled": true,
+    "reverse_pair_probability": 0.0,
+    "shared_flip_probability": 0.5,
+    "intensity_probability": 0.9,
+    "intensity_pair_mode": "independent"
+  },
+  "optimization": {
+    "epochs": 160,
+    "workers": 4,
+    "validate_every": 1
+  },
+  "monitoring": {
+    "selection_metric": "ncc_after",
+    "fail_fast_start_epoch": 20,
+    "best_checkpoint_minimum_dice_improvement": null,
+    "progress_thresholds": [
+      {"epoch": 30, "minimum_best_ncc_improvement": 0.01},
+      {"epoch": 70, "minimum_best_ncc_improvement": 0.03},
+      {"epoch": 110, "minimum_best_ncc_improvement": 0.05}
+    ]
+  }
+}

@@ -135,21 +135,57 @@ def evaluate_segmentation_pair(
     spacing_dhw: Sequence[float],
     response_aware: bool = True,
     valid_labels: Optional[Iterable[int]] = None,
+    compute_surface: bool = True,
 ) -> Dict[str, object]:
-    dice = dice_per_class(
-        prediction,
-        target,
-        labels,
-        response_aware=response_aware,
-        valid_labels=valid_labels,
-    )
-    surfaces: Dict[int, Dict[str, float]] = {}
-    for label in dice:
-        surfaces[label] = surface_distance_metrics(
-            np.asarray(prediction) == label,
-            np.asarray(target) == label,
-            spacing_dhw,
+    prediction = np.asarray(prediction)
+    target = np.asarray(target)
+    label_values = tuple(int(label) for label in labels)
+    if prediction.shape != target.shape:
+        raise ValueError("prediction and target shapes must match")
+    if prediction.ndim == 3:
+        masks = {
+            label: (prediction == label, target == label)
+            for label in label_values
+        }
+    elif prediction.ndim == 4 and prediction.shape[0] == len(label_values):
+        masks = {
+            label: (prediction[index] > 0, target[index] > 0)
+            for index, label in enumerate(label_values)
+        }
+    else:
+        raise ValueError(
+            "segmentations must be 3D label maps or [number_of_labels,D,H,W] binary arrays"
         )
+    valid = None if valid_labels is None else {
+        int(label) for label in valid_labels
+    }
+    dice: Dict[int, float] = {}
+    selected_masks = {}
+    for label, (pred_mask, target_mask) in masks.items():
+        if valid is not None and label not in valid:
+            continue
+        if valid is None and response_aware and (
+            not pred_mask.any() or not target_mask.any()
+        ):
+            continue
+        denominator = int(pred_mask.sum()) + int(target_mask.sum())
+        dice[label] = (
+            1.0
+            if denominator == 0
+            else float(
+                2.0 * np.logical_and(pred_mask, target_mask).sum()
+                / denominator
+            )
+        )
+        selected_masks[label] = (pred_mask, target_mask)
+    surfaces: Dict[int, Dict[str, float]] = {}
+    if compute_surface:
+        for label, (pred_mask, target_mask) in selected_masks.items():
+            surfaces[label] = surface_distance_metrics(
+                pred_mask,
+                target_mask,
+                spacing_dhw,
+            )
     dice_values = list(dice.values())
     hd95_values = [value["hd95"] for value in surfaces.values() if np.isfinite(value["hd95"])]
     assd_values = [value["assd"] for value in surfaces.values() if np.isfinite(value["assd"])]

@@ -1,0 +1,57 @@
+{
+  "extends": "gaussian_native_v12_hntsmrg24.json",
+  "schema_version": 12,
+  "experiment_name": "gaussian_native_v12_segrap2023",
+  "data": {
+    "cohort": "SegRap2023 inter-patient contrast-enhanced CT",
+    "shape_dhw": [176, 160, 160],
+    "spacing_dhw": [2.0, 2.0, 2.0],
+    "moving_timepoint": "affine-prealigned moving-patient contrast CT",
+    "fixed_timepoint": "affine-prealigned fixed-patient contrast CT",
+    "labels_available": true,
+    "labels_for_training": true,
+    "evaluation_labels": [
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+      11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+      21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+      31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+      41, 42, 43, 44, 45
+    ],
+    "supervision_protocol": "delayed weak supervision on representative OARs; all 45 OARs are evaluated"
+  },
+  "loss": {
+    "ngf_weight": 0.08
+  },
+  "supervised_anatomy": {
+    "enabled": true,
+    "labels": [2, 9, 10, 15, 20, 21, 28, 29, 30, 31, 33, 34, 35, 40, 41],
+    "label_weights": [
+      1.0, 1.0, 1.0, 1.0, 1.0,
+      1.0, 1.0, 1.0, 1.0, 1.0,
+      1.0, 1.0, 1.0, 1.0, 1.0
+    ],
+    "dice_loss_weight": 1.0,
+    "boundary_loss_weight": 0.15,
+    "centroid_loss_weight": 0.1,
+    "inverse_dice_loss_weight": 0.1,
+    "start_epoch": 31,
+    "weight_factor_start": 0.05,
+    "weight_factor_end": 0.35,
+    "weight_ramp_epochs": 25
+  },
+  "optimization": {
+    "epochs": 180,
+    "workers": 2,
+    "validate_every": 1
+  },
+  "monitoring": {
+    "selection_metric": "mean_dice",
+    "fail_fast_start_epoch": 25,
+    "best_checkpoint_minimum_dice_improvement": 0.0,
+    "progress_thresholds": [
+      {"epoch": 40, "minimum_best_dice_improvement": 0.005},
+      {"epoch": 80, "minimum_best_dice_improvement": 0.02},
+      {"epoch": 130, "minimum_best_dice_improvement": 0.035}
+    ]
+  }
+}

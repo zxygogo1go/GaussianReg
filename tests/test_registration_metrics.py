@@ -5,6 +5,7 @@ import torch
 
 from metrics import (
     dice_per_class,
+    evaluate_segmentation_pair,
     jacobian_determinant,
     jacobian_metrics,
     surface_distance_metrics,
@@ -56,6 +57,20 @@ class RegistrationMetricTests(unittest.TestCase):
         metrics = jacobian_metrics(flow)
         self.assertEqual(metrics["negative_jacobian_ratio"], 0.0)
         self.assertEqual(metrics["minimum_jacobian"], 1.0)
+
+    def test_overlapping_binary_channels_are_scored_independently(self):
+        segmentation = np.zeros((2, 8, 8, 8), dtype=np.uint8)
+        segmentation[0, 1:6, 1:6, 1:6] = 1
+        segmentation[1, 2:4, 2:4, 2:4] = 1
+        result = evaluate_segmentation_pair(
+            segmentation,
+            segmentation,
+            labels=(4, 9),
+            spacing_dhw=(1.0, 1.0, 1.0),
+            valid_labels=(4, 9),
+        )
+        self.assertEqual(result["dice_per_class"], {4: 1.0, 9: 1.0})
+        self.assertEqual(result["mean_dice"], 1.0)
 
 
 if __name__ == "__main__":

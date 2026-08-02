@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -11,9 +14,11 @@ from experiment_utils import (
     build_objective,
     config_architecture,
     configure_model_for_epoch,
+    configured_evaluation_labels,
     correspondence_temperature_for_epoch,
     feature_residual_weight_for_epoch,
     learning_rate_factor,
+    load_json,
     warp_volume,
 )
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
@@ -33,6 +38,33 @@ from train_registration import (
 
 
 class ExperimentUtilityTests(unittest.TestCase):
+    def test_config_inheritance_deep_merges_and_can_disable_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (root / "base.json").open("w") as handle:
+                json.dump(
+                    {
+                        "data": {"shape_dhw": [32, 32, 32]},
+                        "optimization": {"epochs": 10, "workers": 4},
+                    },
+                    handle,
+                )
+            with (root / "child.json").open("w") as handle:
+                json.dump(
+                    {
+                        "extends": "base.json",
+                        "data": {
+                            "labels_available": False,
+                            "evaluation_labels": [],
+                        },
+                        "optimization": {"epochs": 20},
+                    },
+                    handle,
+                )
+            config = load_json(str(root / "child.json"))
+            self.assertEqual(config["optimization"], {"epochs": 20, "workers": 4})
+            self.assertEqual(configured_evaluation_labels(config), ())
+
     def test_warp_and_statistical_helpers(self):
         source = torch.arange(5.0).view(1, 1, 1, 1, 5).expand(1, 1, 3, 3, 5)
         identity = warp_volume(source, torch.zeros(1, 3, 3, 3, 5))

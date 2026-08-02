@@ -1,5 +1,8 @@
 # Gaussian-native diffeomorphic registration for longitudinal head-and-neck MRI
 
+HaN-Seg, Head-Neck-CBCT-CT, and SegRap2023 preprocessing/training commands are
+in [`docs/external_head_neck_training.md`](docs/external_head_neck_training.md).
+
 This repository contains a new registration model whose core representation,
 correspondence, and coarse deformation parameters are Gaussian primitives.
 Current revisions add a bounded residual image pyramid for fine deformation.

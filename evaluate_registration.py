@@ -1,4 +1,4 @@
-"""Evaluate a registration checkpoint on patient-disjoint HNTS-MRG24 pairs."""
+"""Evaluate a registration checkpoint on patient-disjoint head-and-neck pairs."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from experiment_utils import (
     build_model,
     configure_model_for_epoch,
     config_architecture,
+    configured_evaluation_labels,
     cuda_autocast,
     load_json,
     resolve_device,
@@ -42,14 +43,15 @@ def _case_metric(record: Mapping[str, object], path: Sequence[str]) -> float:
     return float(value)
 
 
-def _summarize(records: Sequence[Mapping[str, object]], seed: int, bootstrap_samples: int):
+def _summarize(
+    records: Sequence[Mapping[str, object]],
+    labels: Sequence[int],
+    seed: int,
+    bootstrap_samples: int,
+):
     paths = {
         "ncc_before": ("image", "ncc_before"),
         "ncc_after": ("image", "ncc_after"),
-        "dice_before": ("segmentation_before", "mean_dice"),
-        "dice_after": ("segmentation_after", "mean_dice"),
-        "hd95_after_mm": ("segmentation_after", "mean_hd95"),
-        "assd_after_mm": ("segmentation_after", "mean_assd"),
         "negative_jacobian_ratio": ("jacobian", "negative_jacobian_ratio"),
         "below_safe_jacobian_ratio": ("jacobian", "below_safe_jacobian_ratio"),
         "minimum_jacobian": ("jacobian", "minimum_jacobian"),
@@ -58,7 +60,31 @@ def _summarize(records: Sequence[Mapping[str, object]], seed: int, bootstrap_sam
         "inference_seconds": ("runtime", "inference_seconds"),
         "peak_gpu_memory_mb": ("runtime", "peak_gpu_memory_mb"),
     }
-    summary: Dict[str, object] = {"num_patients": len(records)}
+    if labels:
+        paths.update(
+            {
+                "dice_before": ("segmentation_before", "mean_dice"),
+                "dice_after": ("segmentation_after", "mean_dice"),
+                "hd95_after_mm": (
+                    "segmentation_after",
+                    "mean_hd95",
+                ),
+                "assd_after_mm": (
+                    "segmentation_after",
+                    "mean_assd",
+                ),
+            }
+        )
+    subject_ids = {
+        str(record.get(field))
+        for record in records
+        for field in ("moving_subject_id", "fixed_subject_id")
+        if record.get(field) is not None
+    }
+    summary: Dict[str, object] = {
+        "num_pairs": len(records),
+        "num_patients": len(subject_ids) if subject_ids else len(records),
+    }
     for offset, (name, path) in enumerate(paths.items()):
         values = _finite(_case_metric(record, path) for record in records)
         summary[name] = bootstrap_mean_ci(values, samples=bootstrap_samples, seed=seed + offset)
@@ -66,18 +92,21 @@ def _summarize(records: Sequence[Mapping[str, object]], seed: int, bootstrap_sam
         _case_metric(record, ("image", "ncc_after")) - _case_metric(record, ("image", "ncc_before"))
         for record in records
     )
-    dice_improvements = _finite(
-        _case_metric(record, ("segmentation_after", "mean_dice"))
-        - _case_metric(record, ("segmentation_before", "mean_dice"))
-        for record in records
-    )
     summary["ncc_improvement"] = bootstrap_mean_ci(
         ncc_improvements, samples=bootstrap_samples, seed=seed + 100
     )
-    summary["dice_improvement"] = bootstrap_mean_ci(
-        dice_improvements, samples=bootstrap_samples, seed=seed + 101
-    )
-    for label in (1, 2):
+    if labels:
+        dice_improvements = _finite(
+            _case_metric(record, ("segmentation_after", "mean_dice"))
+            - _case_metric(record, ("segmentation_before", "mean_dice"))
+            for record in records
+        )
+        summary["dice_improvement"] = bootstrap_mean_ci(
+            dice_improvements,
+            samples=bootstrap_samples,
+            seed=seed + 101,
+        )
+    for label in labels:
         values = []
         for record in records:
             per_class = record["segmentation_after"]["dice_per_class"]
@@ -90,20 +119,17 @@ def _summarize(records: Sequence[Mapping[str, object]], seed: int, bootstrap_sam
     return summary
 
 
-def _write_csv(path: Path, records: Sequence[Mapping[str, object]]) -> None:
+def _write_csv(
+    path: Path,
+    records: Sequence[Mapping[str, object]],
+    labels: Sequence[int],
+) -> None:
     fields = [
         "patient_id",
-        "valid_labels",
+        "moving_subject_id",
+        "fixed_subject_id",
         "ncc_before",
         "ncc_after",
-        "mean_dice_before",
-        "mean_dice_after",
-        "dice_label_1_before",
-        "dice_label_1_after",
-        "dice_label_2_before",
-        "dice_label_2_after",
-        "mean_hd95_after_mm",
-        "mean_assd_after_mm",
         "negative_jacobian_ratio",
         "below_safe_jacobian_ratio",
         "minimum_jacobian",
@@ -113,42 +139,104 @@ def _write_csv(path: Path, records: Sequence[Mapping[str, object]]) -> None:
         "inference_seconds",
         "peak_gpu_memory_mb",
     ]
+    if labels:
+        fields[1:1] = [
+            "valid_labels",
+            "mean_dice_before",
+            "mean_dice_after",
+            "mean_hd95_after_mm",
+            "mean_assd_after_mm",
+            *[
+                field
+                for label in labels
+                for field in (
+                    "dice_label_%d_before" % label,
+                    "dice_label_%d_after" % label,
+                )
+            ],
+        ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for record in records:
-            before = record["segmentation_before"]
-            after = record["segmentation_after"]
-            before_dice = before["dice_per_class"]
-            after_dice = after["dice_per_class"]
-            writer.writerow(
-                {
+            row = {
                     "patient_id": record["patient_id"],
-                    "valid_labels": ";".join(str(value) for value in record["valid_labels"]),
+                    "moving_subject_id": record.get("moving_subject_id", ""),
+                    "fixed_subject_id": record.get("fixed_subject_id", ""),
                     "ncc_before": record["image"]["ncc_before"],
                     "ncc_after": record["image"]["ncc_after"],
-                    "mean_dice_before": before["mean_dice"],
-                    "mean_dice_after": after["mean_dice"],
-                    "dice_label_1_before": before_dice.get(1, before_dice.get("1", "")),
-                    "dice_label_1_after": after_dice.get(1, after_dice.get("1", "")),
-                    "dice_label_2_before": before_dice.get(2, before_dice.get("2", "")),
-                    "dice_label_2_after": after_dice.get(2, after_dice.get("2", "")),
-                    "mean_hd95_after_mm": after["mean_hd95"],
-                    "mean_assd_after_mm": after["mean_assd"],
                     **record["jacobian"],
                     **record["deformation"],
                     "inference_seconds": record["runtime"]["inference_seconds"],
                     "peak_gpu_memory_mb": record["runtime"]["peak_gpu_memory_mb"],
                 }
+            if labels:
+                before = record["segmentation_before"]
+                after = record["segmentation_after"]
+                before_dice = before["dice_per_class"]
+                after_dice = after["dice_per_class"]
+                row.update(
+                    {
+                        "valid_labels": ";".join(
+                            str(value) for value in record["valid_labels"]
+                        ),
+                        "mean_dice_before": before["mean_dice"],
+                        "mean_dice_after": after["mean_dice"],
+                        "mean_hd95_after_mm": after["mean_hd95"],
+                        "mean_assd_after_mm": after["mean_assd"],
+                    }
+                )
+                for label in labels:
+                    row["dice_label_%d_before" % label] = before_dice.get(
+                        label,
+                        before_dice.get(str(label), ""),
+                    )
+                    row["dice_label_%d_after" % label] = after_dice.get(
+                        label,
+                        after_dice.get(str(label), ""),
+                    )
+            writer.writerow(row)
+
+
+def _segmentation_channels(
+    segmentation: torch.Tensor,
+    labels: Sequence[int],
+) -> torch.Tensor:
+    if int(segmentation.shape[1]) == 1:
+        return torch.cat(
+            [(segmentation == int(label)).float() for label in labels],
+            dim=1,
+        )
+    if int(segmentation.shape[1]) != len(labels):
+        raise AssertionError(
+            "binary segmentation channels must match configured labels"
+        )
+    return segmentation.float().clamp(0.0, 1.0)
+
+
+def _warp_segmentation_channels(
+    segmentation: torch.Tensor,
+    flow: torch.Tensor,
+    chunk_size: int = 8,
+) -> torch.Tensor:
+    parts = []
+    for start in range(0, int(segmentation.shape[1]), int(chunk_size)):
+        parts.append(
+            warp_volume(
+                segmentation[:, start : start + chunk_size],
+                flow.float(),
+                mode="bilinear",
             )
+        )
+    return torch.cat(parts, dim=1).clamp(0.0, 1.0)
 
 
 @torch.inference_mode()
 def main(expected_architecture: Optional[str] = None) -> None:
     description = (
-        "Evaluate an original SACB-Net checkpoint on patient-disjoint HNTS-MRG24 pairs."
+        "Evaluate an original SACB-Net checkpoint on head-and-neck pairs."
         if expected_architecture == "sacb"
-        else "Evaluate Gaussian-native diffeomorphic registration on HNTS-MRG24."
+        else "Evaluate Gaussian-native diffeomorphic head-and-neck registration."
     )
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--checkpoint", required=True)
@@ -185,12 +273,14 @@ def main(expected_architecture: Optional[str] = None) -> None:
     seed = int(config.get("seed", 2026))
     set_reproducibility(seed)
     device = resolve_device(args.device)
+    labels = configured_evaluation_labels(config)
     shape = tuple(int(value) for value in dict(config.get("data", {})).get("shape_dhw", (128, 160, 160)))
     dataset = HeadNeckRegistrationDataset(
         args.manifest,
         args.data_root,
         expected_shape=shape,
-        load_segmentations=True,
+        load_segmentations=bool(labels),
+        labels=labels,
     )
     loader = DataLoader(
         dataset,
@@ -337,29 +427,7 @@ def main(expected_architecture: Optional[str] = None) -> None:
         if not bool(torch.isfinite(flow).all() and torch.isfinite(warped).all()):
             raise FloatingPointError("non-finite prediction for patient %s" % patient_id)
 
-        moving_seg_device = sample["moving_seg"].to(device, non_blocking=True).float()
-        warped_seg = warp_volume(moving_seg_device, flow.float(), mode="nearest").round().long()
-        moving_seg = sample["moving_seg"][0, 0].numpy()
-        fixed_seg = sample["fixed_seg"][0, 0].numpy()
-        warped_seg_np = warped_seg[0, 0].cpu().numpy().astype(np.int16, copy=False)
-        valid_labels = [index + 1 for index, flag in enumerate(sample["response_valid"][0].tolist()) if flag]
         spacing = tuple(float(value) for value in sample["spacing_dhw"][0].tolist())
-        before = evaluate_segmentation_pair(
-            moving_seg,
-            fixed_seg,
-            labels=(1, 2),
-            spacing_dhw=spacing,
-            response_aware=True,
-            valid_labels=valid_labels,
-        )
-        after = evaluate_segmentation_pair(
-            warped_seg_np,
-            fixed_seg,
-            labels=(1, 2),
-            spacing_dhw=spacing,
-            response_aware=True,
-            valid_labels=valid_labels,
-        )
         flow_float = flow.float()
         jacobian = jacobian_metrics(flow_float, spacing_dhw=spacing)
         spacing_tensor = flow_float.new_tensor(spacing).view(1, 3, 1, 1, 1)
@@ -376,36 +444,113 @@ def main(expected_architecture: Optional[str] = None) -> None:
         }
         record = {
             "patient_id": patient_id,
-            "valid_labels": valid_labels,
             "spacing_dhw": list(spacing),
             "image": {
                 "ncc_before": float((-ncc(fixed, moving)).float().cpu()),
                 "ncc_after": float((-ncc(fixed, warped)).float().cpu()),
             },
-            "segmentation_before": before,
-            "segmentation_after": after,
             "jacobian": jacobian,
             "deformation": deformation,
             "runtime": runtime,
         }
+        for field in ("moving_subject_id", "fixed_subject_id"):
+            if field in sample:
+                record[field] = str(sample[field][0])
+        warped_seg_np = None
+        if labels:
+            moving_seg_device = sample["moving_seg"].to(
+                device,
+                non_blocking=True,
+            )
+            fixed_seg_device = sample["fixed_seg"].to(
+                device,
+                non_blocking=True,
+            )
+            moving_channels = _segmentation_channels(
+                moving_seg_device,
+                labels,
+            )
+            fixed_channels = _segmentation_channels(
+                fixed_seg_device,
+                labels,
+            )
+            warped_channels = _warp_segmentation_channels(
+                moving_channels,
+                flow_float,
+            )
+            moving_seg = moving_channels[0].cpu().numpy() > 0.5
+            fixed_seg = fixed_channels[0].cpu().numpy() > 0.5
+            warped_seg_np = warped_channels[0].cpu().numpy() > 0.5
+            valid_labels = [
+                int(label)
+                for label, flag in zip(
+                    labels,
+                    sample["response_valid"][0].tolist(),
+                )
+                if flag
+            ]
+            before = evaluate_segmentation_pair(
+                moving_seg,
+                fixed_seg,
+                labels=labels,
+                spacing_dhw=spacing,
+                response_aware=True,
+                valid_labels=valid_labels,
+            )
+            after = evaluate_segmentation_pair(
+                warped_seg_np,
+                fixed_seg,
+                labels=labels,
+                spacing_dhw=spacing,
+                response_aware=True,
+                valid_labels=valid_labels,
+            )
+            record.update(
+                {
+                    "valid_labels": valid_labels,
+                    "segmentation_before": before,
+                    "segmentation_after": after,
+                }
+            )
         records.append(record)
         if args.save_predictions:
             np.save(str(prediction_dir / (patient_id + "_flow_dhw.npy")), flow_float[0].cpu().numpy(), allow_pickle=False)
-            np.save(str(prediction_dir / (patient_id + "_warped_seg.npy")), warped_seg_np, allow_pickle=False)
+            if warped_seg_np is not None:
+                np.save(
+                    str(prediction_dir / (patient_id + "_warped_seg.npy")),
+                    warped_seg_np.astype(np.uint8, copy=False),
+                    allow_pickle=False,
+                )
             np.save(str(prediction_dir / (patient_id + "_warped_image.npy")), warped[0, 0].float().cpu().numpy(), allow_pickle=False)
-        print(
-            "%s ncc %.4f -> %.4f dice %.4f -> %.4f fold %.6f"
-            % (
-                patient_id,
-                record["image"]["ncc_before"],
-                record["image"]["ncc_after"],
-                before["mean_dice"],
-                after["mean_dice"],
-                jacobian["negative_jacobian_ratio"],
+        if labels:
+            print(
+                "%s ncc %.4f -> %.4f dice %.4f -> %.4f fold %.6f"
+                % (
+                    patient_id,
+                    record["image"]["ncc_before"],
+                    record["image"]["ncc_after"],
+                    before["mean_dice"],
+                    after["mean_dice"],
+                    jacobian["negative_jacobian_ratio"],
+                )
             )
-        )
+        else:
+            print(
+                "%s ncc %.4f -> %.4f fold %.6f"
+                % (
+                    patient_id,
+                    record["image"]["ncc_before"],
+                    record["image"]["ncc_after"],
+                    jacobian["negative_jacobian_ratio"],
+                )
+            )
 
-    summary = _summarize(records, seed=seed, bootstrap_samples=int(args.bootstrap_samples))
+    summary = _summarize(
+        records,
+        labels=labels,
+        seed=seed,
+        bootstrap_samples=int(args.bootstrap_samples),
+    )
     result = {
         "architecture": architecture,
         "architecture_revision": getattr(
@@ -428,11 +573,15 @@ def main(expected_architecture: Optional[str] = None) -> None:
             "flow_convention": "fixed-grid to moving-image sampling displacement in DHW voxel units",
             "response_aware": "only labels present in both original moving and fixed masks are eligible",
             "hd95_assd_units": "millimetres",
-            "tre": "not reported because HNTS-MRG24 provides no landmark annotations",
+            "tre": "not reported because the configured manifest provides no landmark annotations",
         },
     }
     save_json(output_dir / "evaluation.json", result)
-    _write_csv(output_dir / "per_patient_metrics.csv", records)
+    _write_csv(
+        output_dir / "per_patient_metrics.csv",
+        records,
+        labels,
+    )
     print(json.dumps(to_json_safe(summary), indent=2, sort_keys=True, allow_nan=False))
 
 

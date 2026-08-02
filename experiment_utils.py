@@ -19,12 +19,40 @@ from model import SACB_Net
 from gaussian_native import GaussianNativeObjective, GaussianNativeRegistration
 
 
-def load_json(path: str) -> Dict[str, object]:
-    with Path(path).open("r") as handle:
+def _deep_merge(
+    base: Mapping[str, object],
+    override: Mapping[str, object],
+) -> Dict[str, object]:
+    result = dict(base)
+    for key, value in override.items():
+        if (
+            key in result
+            and isinstance(result[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_json(path: str, _stack: Optional[Sequence[Path]] = None) -> Dict[str, object]:
+    config_path = Path(path).resolve()
+    stack = tuple(_stack or ())
+    if config_path in stack:
+        raise ValueError("circular config inheritance: %s" % config_path)
+    with config_path.open("r") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
         raise ValueError("experiment config must be a JSON object")
-    return value
+    parent = value.pop("extends", None)
+    if parent is None:
+        return value
+    parent_path = Path(str(parent))
+    if not parent_path.is_absolute():
+        parent_path = config_path.parent / parent_path
+    base = load_json(str(parent_path), _stack=stack + (config_path,))
+    return _deep_merge(base, value)
 
 
 def to_json_safe(value):
@@ -159,6 +187,27 @@ def config_architecture(config: Mapping[str, object]) -> str:
     if architecture not in aliases:
         raise ValueError("unsupported model.architecture: %s" % architecture)
     return aliases[architecture]
+
+
+def configured_evaluation_labels(
+    config: Mapping[str, object],
+) -> tuple[int, ...]:
+    """Return ordered registration labels, or an empty tuple when unavailable."""
+    data = dict(config.get("data", {}))
+    if not bool(data.get("labels_available", True)):
+        return ()
+    configured = data.get("evaluation_labels")
+    if configured is None:
+        configured = dict(config.get("supervised_anatomy", {})).get(
+            "labels",
+            (1, 2),
+        )
+    labels = tuple(int(value) for value in configured)
+    if len(labels) != len(set(labels)) or any(label <= 0 for label in labels):
+        raise ValueError(
+            "data.evaluation_labels must contain unique positive integers"
+        )
+    return labels
 
 
 def _configure_sacb_kmeans(

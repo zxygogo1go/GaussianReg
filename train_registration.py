@@ -1,4 +1,4 @@
-"""Train a configured registration model on preprocessed HNTS-MRG24 pairs."""
+"""Train a configured registration model on preprocessed head-and-neck pairs."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from experiment_utils import (
     build_objective,
     configure_model_for_epoch,
     config_architecture,
+    configured_evaluation_labels,
     cuda_autocast,
     finite_mean,
     learning_rate_factor,
@@ -584,6 +585,45 @@ def _masked_centroid_distance(
     )
 
 
+def _segmentation_channels(
+    segmentation: torch.Tensor,
+    labels: Sequence[int],
+) -> torch.Tensor:
+    """Convert an integer map or pass through ordered binary channels."""
+    if segmentation.ndim != 5:
+        raise AssertionError("segmentation must have shape [B,C,D,H,W]")
+    if int(segmentation.shape[1]) == 1:
+        return torch.cat(
+            [(segmentation == int(label)).float() for label in labels],
+            dim=1,
+        )
+    if int(segmentation.shape[1]) != len(labels):
+        raise AssertionError(
+            "binary segmentation channels must match configured labels"
+        )
+    return segmentation.float().clamp(0.0, 1.0)
+
+
+def _warp_segmentation_channels(
+    segmentation: torch.Tensor,
+    flow: torch.Tensor,
+    chunk_size: int = 8,
+) -> torch.Tensor:
+    """Warp many binary masks without one large grid-sample allocation."""
+    if chunk_size <= 0:
+        raise ValueError("segmentation chunk size must be positive")
+    warped = []
+    for start in range(0, int(segmentation.shape[1]), int(chunk_size)):
+        warped.append(
+            warp_volume(
+                segmentation[:, start : start + chunk_size].float(),
+                flow.float(),
+                mode="bilinear",
+            )
+        )
+    return torch.cat(warped, dim=1).clamp(0.0, 1.0)
+
+
 def _supervised_anatomy_loss(
     output: Mapping[str, object],
     moving_seg: torch.Tensor,
@@ -621,14 +661,8 @@ def _supervised_anatomy_loss(
         configured_label_weights,
         dtype=torch.float32,
     )
-    moving_one_hot = torch.cat(
-        [(moving_seg == label).float() for label in labels],
-        dim=1,
-    )
-    fixed_one_hot = torch.cat(
-        [(fixed_seg == label).float() for label in labels],
-        dim=1,
-    )
+    moving_one_hot = _segmentation_channels(moving_seg, labels)
+    fixed_one_hot = _segmentation_channels(fixed_seg, labels)
     stage_flows = list(output.get("pyramid_flow", ()))
     if (
         stage_flows
@@ -1134,6 +1168,7 @@ def _validate(
     amp: bool,
     amp_dtype: str,
     amp_cache_enabled: bool,
+    labels: Sequence[int],
 ) -> Dict[str, float]:
     model.eval()
     case_records = []
@@ -1150,63 +1185,108 @@ def _validate(
             warped, flow = model(moving, fixed, return_aux=False)
             ncc_before = -objective.ncc(fixed, moving)
             ncc_after = -objective.ncc(fixed, warped)
-        moving_seg = sample["moving_seg"].to(device, non_blocking=True).float()
-        warped_seg = warp_volume(moving_seg, flow.float(), mode="nearest").round().long()
-        moving_seg_np = sample["moving_seg"][0, 0].numpy()
-        fixed_seg_np = sample["fixed_seg"][0, 0].numpy()
-        warped_seg_np = warped_seg[0, 0].cpu().numpy()
-        valid_labels = [index + 1 for index, flag in enumerate(sample["response_valid"][0].tolist()) if flag]
         spacing = tuple(float(value) for value in sample["spacing_dhw"][0].tolist())
         spacing_tensor = flow.new_tensor(spacing).view(1, 3, 1, 1, 1)
         displacement_mm = torch.linalg.vector_norm(
             flow.float() * spacing_tensor,
             dim=1,
         )
-        segmentation_before = evaluate_segmentation_pair(
-            moving_seg_np,
-            fixed_seg_np,
-            labels=(1, 2),
-            spacing_dhw=spacing,
-            response_aware=True,
-            valid_labels=valid_labels,
-        )
-        segmentation_after = evaluate_segmentation_pair(
-            warped_seg_np,
-            fixed_seg_np,
-            labels=(1, 2),
-            spacing_dhw=spacing,
-            response_aware=True,
-            valid_labels=valid_labels,
-        )
         jacobian = jacobian_metrics(flow.float(), spacing_dhw=spacing)
-        case_records.append(
-            {
+        case_record = {
                 "ncc_before": float(ncc_before.float().cpu()),
                 "ncc_after": float(ncc_after.float().cpu()),
                 "ncc_improvement": float(
                     (ncc_after - ncc_before).float().cpu()
                 ),
-                "dice_before": float(segmentation_before["mean_dice"]),
-                "mean_dice": float(segmentation_after["mean_dice"]),
-                "dice_improvement": float(
-                    segmentation_after["mean_dice"]
-                    - segmentation_before["mean_dice"]
-                ),
-                "mean_hd95": float(segmentation_after["mean_hd95"]),
-                "mean_assd": float(segmentation_after["mean_assd"]),
                 "mean_displacement_mm": float(displacement_mm.mean().cpu()),
                 "p95_displacement_mm": float(
                     torch.quantile(displacement_mm, 0.95).cpu()
                 ),
                 **jacobian,
-                **{
-                    "dice_label_%d" % label: float(value)
-                    for label, value in segmentation_after[
-                        "dice_per_class"
-                    ].items()
-                },
             }
-        )
+        if labels:
+            moving_seg = sample["moving_seg"].to(
+                device,
+                non_blocking=True,
+            )
+            fixed_seg = sample["fixed_seg"].to(
+                device,
+                non_blocking=True,
+            )
+            moving_channels = _segmentation_channels(
+                moving_seg,
+                labels,
+            )
+            fixed_channels = _segmentation_channels(
+                fixed_seg,
+                labels,
+            )
+            warped_channels = _warp_segmentation_channels(
+                moving_channels,
+                flow,
+            )
+            valid_labels = [
+                int(label)
+                for label, flag in zip(
+                    labels,
+                    sample["response_valid"][0].tolist(),
+                )
+                if flag
+            ]
+            moving_seg_np = (
+                moving_channels[0].detach().cpu().numpy() > 0.5
+            )
+            fixed_seg_np = (
+                fixed_channels[0].detach().cpu().numpy() > 0.5
+            )
+            warped_seg_np = (
+                warped_channels[0].detach().cpu().numpy() > 0.5
+            )
+            segmentation_before = evaluate_segmentation_pair(
+                moving_seg_np,
+                fixed_seg_np,
+                labels=labels,
+                spacing_dhw=spacing,
+                response_aware=True,
+                valid_labels=valid_labels,
+                compute_surface=False,
+            )
+            segmentation_after = evaluate_segmentation_pair(
+                warped_seg_np,
+                fixed_seg_np,
+                labels=labels,
+                spacing_dhw=spacing,
+                response_aware=True,
+                valid_labels=valid_labels,
+                compute_surface=False,
+            )
+            case_record.update(
+                {
+                    "dice_before": float(
+                        segmentation_before["mean_dice"]
+                    ),
+                    "mean_dice": float(
+                        segmentation_after["mean_dice"]
+                    ),
+                    "dice_improvement": float(
+                        segmentation_after["mean_dice"]
+                        - segmentation_before["mean_dice"]
+                    ),
+                    "mean_hd95": float(
+                        segmentation_after["mean_hd95"]
+                    ),
+                    "mean_assd": float(
+                        segmentation_after["mean_assd"]
+                    ),
+                    **{
+                        "dice_label_%d" % label: float(value)
+                        for label, value in segmentation_after[
+                            "dice_per_class"
+                        ].items()
+                    },
+                }
+            )
+        case_records.append(case_record)
     names = sorted({name for record in case_records for name in record})
     return {name: finite_mean(record.get(name, float("nan")) for record in case_records) for name in names}
 
@@ -1494,9 +1574,9 @@ def _checkpoint(
 
 def main(expected_architecture: str = "gaussian_native") -> None:
     description = (
-        "Train the original SACB-Net baseline on preprocessed HNTS-MRG24 longitudinal pairs."
+        "Train the original SACB-Net baseline on preprocessed head-and-neck pairs."
         if expected_architecture == "sacb"
-        else "Train Gaussian-native diffeomorphic registration on HNTS-MRG24."
+        else "Train Gaussian-native diffeomorphic head-and-neck registration."
     )
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", required=True, help="JSON experiment config")
@@ -1536,11 +1616,18 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     supervised_enabled = bool(
         supervised_anatomy.get("enabled", False)
     )
+    supervised_labels = tuple(
+        int(value)
+        for value in supervised_anatomy.get("labels", (1, 2))
+    )
+    evaluation_labels = configured_evaluation_labels(config)
+    if supervised_enabled and not supervised_labels:
+        raise ValueError("supervised anatomy requires at least one label")
     if supervised_enabled and float(
         augmentation.get("reverse_pair_probability", 0.0)
     ) > 0.0:
         raise ValueError(
-            "the longitudinal supervised experiment requires "
+            "the configured supervised experiment requires "
             "reverse_pair_probability=0"
         )
     data_config = dict(config.get("data", {}))
@@ -1550,12 +1637,14 @@ def main(expected_architecture: str = "gaussian_native") -> None:
         args.data_root,
         expected_shape=shape,
         load_segmentations=supervised_enabled,
+        labels=supervised_labels,
     )
     validation_dataset = HeadNeckRegistrationDataset(
         args.validation_manifest,
         args.data_root,
         expected_shape=shape,
-        load_segmentations=True,
+        load_segmentations=bool(evaluation_labels),
+        labels=evaluation_labels,
     )
     workers = int(optimization.get("workers", 4))
     batch_size = int(optimization.get("batch_size", 1))
@@ -1690,6 +1779,10 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             "monitoring.selection_metric must be ncc_after or mean_dice"
         )
     selection_metric = selection_aliases[requested_selection]
+    if selection_metric == "mean_dice" and not evaluation_labels:
+        raise ValueError(
+            "mean_dice checkpoint selection requires data labels"
+        )
     best_checkpoint_name = (
         "best_validation_dice.pt"
         if selection_metric == "mean_dice"
@@ -1810,6 +1903,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                     amp,
                     amp_dtype,
                     amp_cache_enabled,
+                    evaluation_labels,
                 )
                 validation_history.append(
                     {
@@ -1869,6 +1963,15 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             )
             eligible = True
             if monitoring:
+                minimum_dice_gain = monitoring.get(
+                    "best_checkpoint_minimum_dice_improvement"
+                )
+                dice_eligible = (
+                    True
+                    if minimum_dice_gain is None
+                    else np.isfinite(dice_gain)
+                    and dice_gain > float(minimum_dice_gain)
+                )
                 eligible = (
                     np.isfinite(ncc_gain)
                     and ncc_gain
@@ -1886,14 +1989,7 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                             float("inf"),
                         )
                     )
-                    and np.isfinite(dice_gain)
-                    and dice_gain
-                    > float(
-                        monitoring.get(
-                            "best_checkpoint_minimum_dice_improvement",
-                            -float("inf"),
-                        )
-                    )
+                    and dice_eligible
                 )
             improved = (
                 eligible
