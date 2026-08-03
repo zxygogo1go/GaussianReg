@@ -4,12 +4,34 @@ from prepare_head_neck_datasets import (
     HAN_SEG_LABEL_NAMES,
     SEGRAP_LABEL_NAMES,
     SEGRAP_OAR_LABEL_NAMES,
+    _crop_center_physical,
     _cross_patient_pairs,
+    _geometric_center_physical,
     _split_subject_ids,
 )
 
 
 class ExternalPreprocessingTests(unittest.TestCase):
+    def test_geometric_center_uses_full_image_extent(self):
+        class FakeImage:
+            def __init__(self):
+                self.index = None
+
+            def GetSize(self):
+                return (161, 181, 241)
+
+            def TransformContinuousIndexToPhysicalPoint(self, index):
+                self.index = index
+                return tuple(10.0 + 2.0 * value for value in index)
+
+        image = FakeImage()
+        center = _geometric_center_physical(image)
+        self.assertEqual(image.index, (80.0, 90.0, 120.0))
+        self.assertEqual(center, (170.0, 190.0, 250.0))
+        self.assertEqual(_crop_center_physical(image, "geometric"), center)
+        with self.assertRaisesRegex(ValueError, "unknown center policy"):
+            _crop_center_physical(image, "labels")
+
     def test_label_tables_and_patient_split(self):
         self.assertEqual(len(HAN_SEG_LABEL_NAMES), 30)
         self.assertEqual(len(SEGRAP_OAR_LABEL_NAMES), 45)

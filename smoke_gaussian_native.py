@@ -111,9 +111,12 @@ def main() -> None:
             h0 // 2 + 1:h0 + 1,
             w0 // 2:w0,
         ] = 2
-        response_valid = torch.ones(
-            1,
-            2,
+        labels = tuple(
+            int(value)
+            for value in supervised_config.get("labels", (1, 2))
+        )
+        response_valid = torch.tensor(
+            [[label in (1, 2) for label in labels]],
             device=device,
             dtype=torch.bool,
         )

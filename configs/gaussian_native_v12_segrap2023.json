@@ -4,8 +4,8 @@
   "experiment_name": "gaussian_native_v12_segrap2023",
   "data": {
     "cohort": "SegRap2023 inter-patient contrast-enhanced CT",
-    "shape_dhw": [176, 160, 160],
-    "spacing_dhw": [2.0, 2.0, 2.0],
+    "shape_dhw": [192, 160, 160],
+    "spacing_dhw": [2.5, 2.0, 2.0],
     "moving_timepoint": "affine-prealigned moving-patient contrast CT",
     "fixed_timepoint": "affine-prealigned fixed-patient contrast CT",
     "labels_available": true,

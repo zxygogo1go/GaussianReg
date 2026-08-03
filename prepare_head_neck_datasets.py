@@ -1,7 +1,7 @@
 """Prepare HaN-Seg, Head-Neck-CBCT-CT, or SegRap2023 for registration.
 
 HaN-Seg and SegRap2023 are treated as patient-disjoint inter-patient CT
-registration cohorts.  Each scan is body-centred, resampled, and optionally
+registration cohorts.  Each scan is geometry-centred, resampled, and optionally
 rigid/affine aligned to one training-only atlas before deterministic pairs are
 created.  Head-Neck-CBCT-CT is treated as paired CBCT-to-CT registration; its
 provided voxel correspondence is retained and inconsistent NIfTI origins are
@@ -337,6 +337,29 @@ def _body_center_physical(image) -> Tuple[float, float, float]:
     )
 
 
+def _geometric_center_physical(image) -> Tuple[float, float, float]:
+    continuous_index = tuple(
+        0.5 * (float(size) - 1.0) for size in image.GetSize()
+    )
+    return tuple(
+        float(value)
+        for value in image.TransformContinuousIndexToPhysicalPoint(
+            continuous_index
+        )
+    )
+
+
+def _crop_center_physical(
+    image,
+    center_policy: str,
+) -> Tuple[float, float, float]:
+    if center_policy == "geometric":
+        return _geometric_center_physical(image)
+    if center_policy == "body":
+        return _body_center_physical(image)
+    raise ValueError("unknown center policy: %s" % center_policy)
+
+
 def _target_reference(
     center_xyz: Sequence[float],
     spacing_dhw: Sequence[float],
@@ -379,11 +402,12 @@ def _center_subject(
     label_count: int,
     spacing_dhw: Sequence[float],
     shape_dhw: Sequence[int],
+    center_policy: str,
 ):
     sitk = _sitk()
     original_source = sitk.ReadImage(subject.image)
     source = _orient_lps(sitk.Cast(original_source, sitk.sitkFloat32))
-    center = _body_center_physical(source)
+    center = _crop_center_physical(source, center_policy)
     reference = _target_reference(center, spacing_dhw, shape_dhw)
     centered = sitk.Resample(
         source,
@@ -396,10 +420,15 @@ def _center_subject(
     centered = _set_common_geometry(_ct_normalize_image(centered), spacing_dhw)
     channels = np.zeros((label_count,) + tuple(shape_dhw), dtype=np.uint8)
     valid = set(int(value) for value in subject.valid_labels)
-    retained = []
+    expected_labels = []
     for label, path in subject.masks:
         original_mask = sitk.ReadImage(path)
         _validate_geometry(original_source, original_mask, path)
+        source_nonempty = bool(
+            np.asarray(sitk.GetArrayViewFromImage(original_mask) > 0).any()
+        )
+        if int(label) in valid and source_nonempty:
+            expected_labels.append(int(label))
         mask = _orient_lps(original_mask)
         resampled = sitk.Resample(
             mask,
@@ -411,9 +440,17 @@ def _center_subject(
         )
         array = sitk.GetArrayFromImage(resampled) > 0
         channels[int(label) - 1] = array
-        if int(label) in valid and bool(array.any()):
-            retained.append(int(label))
-    return centered, channels, tuple(retained), center
+    missing = [
+        label
+        for label in expected_labels
+        if not bool(channels[int(label) - 1].any())
+    ]
+    if missing:
+        raise ValueError(
+            "crop removed non-empty valid labels for %s: %s"
+            % (subject.subject_id, missing)
+        )
+    return centered, channels, tuple(expected_labels), center
 
 
 def _registration_method(iterations: int, seed: int, learning_rate: float):
@@ -532,6 +569,7 @@ def _preprocess_cross_subject(
     label_count: int,
     spacing_dhw: Sequence[float],
     shape_dhw: Sequence[int],
+    center_policy: str,
     atlas_path: str,
     atlas_subject_id: str,
     prealignment: str,
@@ -551,6 +589,7 @@ def _preprocess_cross_subject(
             != tuple(float(value) for value in spacing_dhw)
             or tuple(record.get("shape_dhw", ()))
             != tuple(int(value) for value in shape_dhw)
+            or record.get("center_policy") != center_policy
             or record.get("prealignment_mode") != prealignment
         ):
             raise ValueError(
@@ -567,8 +606,11 @@ def _preprocess_cross_subject(
         label_count,
         spacing_dhw,
         shape_dhw,
+        center_policy,
     )
-    alignment: Dict[str, object] = {"selected_stage": "body_center"}
+    alignment: Dict[str, object] = {
+        "selected_stage": "%s_center" % center_policy
+    }
     if prealignment == "rigid_affine" and subject.subject_id != atlas_subject_id:
         atlas = sitk.ReadImage(atlas_path, sitk.sitkFloat32)
         image, transform, alignment = _rigid_affine_to_atlas(
@@ -583,6 +625,12 @@ def _preprocess_cross_subject(
         for label in valid_labels
         if bool(channels[int(label) - 1].any())
     ]
+    missing = sorted(set(valid_labels) - set(retained))
+    if missing:
+        raise ValueError(
+            "prealignment removed non-empty valid labels for %s: %s"
+            % (subject.subject_id, missing)
+        )
     image_array = sitk.GetArrayFromImage(image).astype(np.float32, copy=False)
     relative_image = "images/%s.npy" % subject.subject_id
     relative_segmentation = "segmentations/%s.npy" % subject.subject_id
@@ -596,7 +644,8 @@ def _preprocess_cross_subject(
         "valid_labels": retained,
         "spacing_dhw": [float(value) for value in spacing_dhw],
         "shape_dhw": [int(value) for value in shape_dhw],
-        "body_center_lps": list(center),
+        "crop_center_lps": list(center),
+        "center_policy": center_policy,
         "prealignment_mode": prealignment,
         "prealignment": alignment,
         "source_image": subject.image,
@@ -819,6 +868,12 @@ def main() -> None:
     parser.add_argument("--target-spacing", nargs=3, type=float, default=None)
     parser.add_argument("--target-shape", nargs=3, type=int, default=None)
     parser.add_argument(
+        "--center-policy",
+        choices=("geometric", "body"),
+        default="geometric",
+        help="crop centre for inter-patient datasets; ignored for paired data",
+    )
+    parser.add_argument(
         "--prealignment",
         choices=("auto", "body_center", "rigid_affine"),
         default="auto",
@@ -840,8 +895,8 @@ def main() -> None:
     if args.num_workers < 0 or args.registration_iterations <= 0:
         raise ValueError("workers must be nonnegative and iterations positive")
     paired = args.dataset == "head-neck-cbct-ct"
-    default_spacing = (1.5, 1.5, 1.5) if paired else (2.0, 2.0, 2.0)
-    default_shape = (128, 160, 160) if paired else (176, 160, 160)
+    default_spacing = (1.5, 1.5, 1.5) if paired else (2.5, 2.0, 2.0)
+    default_shape = (128, 160, 160) if paired else (192, 160, 160)
     spacing_dhw = tuple(args.target_spacing or default_spacing)
     shape_dhw = tuple(args.target_shape or default_shape)
     if len(spacing_dhw) != 3 or min(spacing_dhw) <= 0.0:
@@ -881,6 +936,7 @@ def main() -> None:
         label_names: Sequence[str] = ()
         atlas_subject_id: Optional[str] = None
         prealignment = "provided_voxel_grid"
+        center_policy = "provided_voxel_grid"
     else:
         if args.dataset == "han-seg":
             subjects, label_names = discover_han_seg(args.source_root)
@@ -900,11 +956,13 @@ def main() -> None:
             if args.prealignment == "auto"
             else args.prealignment
         )
+        center_policy = args.center_policy
         atlas_image, _, _, _ = _center_subject(
             by_id[atlas_subject_id],
             len(label_names),
             spacing_dhw,
             shape_dhw,
+            center_policy,
         )
         atlas_path = output_root / "metadata" / "training_atlas.nii.gz"
         atlas_path.parent.mkdir(parents=True, exist_ok=True)
@@ -916,6 +974,7 @@ def main() -> None:
                 len(label_names),
                 spacing_dhw,
                 shape_dhw,
+                center_policy,
                 str(atlas_path),
                 atlas_subject_id,
                 prealignment,
@@ -963,6 +1022,7 @@ def main() -> None:
         },
         "target_spacing_dhw": list(spacing_dhw),
         "target_shape_dhw": list(shape_dhw),
+        "center_policy": center_policy,
         "prealignment": prealignment,
         "training_atlas_subject_id": atlas_subject_id,
         "label_names": {

@@ -19,8 +19,12 @@ merge them into one integer map because several structures overlap or nest.
 ## 1. Preprocessing
 
 Run from `/home/student3/data2t/TouJing/GaussianReg`. The cross-patient default
-performs body centring and rigid/affine alignment to one training-only atlas.
-Patient identities are split before atlas selection and pairing.
+uses the label-independent image geometric centre, a `192 x 160 x 160` crop,
+`2.5 x 2.0 x 2.0` mm spacing in DHW order, and rigid/affine alignment to one
+training-only atlas. The 480 mm superior-inferior field of view preserves small
+superior OARs without using annotations to choose the crop; the two in-plane
+axes remain at 2 mm. Patient identities are split before atlas selection and
+pairing.
 Each moving subject is paired with three deterministic, non-self fixed
 subjects inside the same split; no pair crosses a patient split.
 
@@ -29,6 +33,10 @@ subjects inside the same split; no pair crosses a patient split.
   --dataset han-seg \
   --source-root /home/student3/data2t/TouJing/HaN-Seg \
   --output-root /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed \
+  --center-policy geometric \
+  --target-spacing 2.5 2.0 2.0 \
+  --target-shape 192 160 160 \
+  --overwrite \
   --num-workers 4
 ```
 
@@ -38,6 +46,10 @@ subjects inside the same split; no pair crosses a patient split.
   --source-root /home/student3/data2t/TouJing/SegRap2023_Training_Set_120cases \
   --output-root /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed \
   --segrap-modality contrast \
+  --center-policy geometric \
+  --target-spacing 2.5 2.0 2.0 \
+  --target-shape 192 160 160 \
+  --overwrite \
   --num-workers 4
 ```
 
@@ -52,7 +64,14 @@ subjects inside the same split; no pair crosses a patient split.
 Each command writes `dataset_summary.json`, per-subject QA metadata, and
 `manifests/{train,validation,test}.csv`. A preprocessing run with any failure
 exits non-zero; inspect the summary rather than adding `--allow-failures` for a
-paper experiment.
+paper experiment. For labelled datasets, preprocessing also exits non-zero if
+an originally non-empty valid label becomes empty after cropping or atlas
+prealignment. `--overwrite` is required above because it replaces the earlier
+body-centred `176 x 160 x 160` preprocessing. The paired CBCT-CT output does not
+need to be regenerated. A complete forward/backward smoke test of the new
+cross-patient shape used 18.3 GB on the server A100; larger depths from 208 to
+240 exceeded the stable BF16 3D-convolution path of the installed PyTorch/CUDA
+stack despite nominal free memory.
 
 ## 2. Training
 
