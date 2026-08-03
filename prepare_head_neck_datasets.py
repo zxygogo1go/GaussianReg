@@ -450,7 +450,13 @@ def _center_subject(
             "crop removed non-empty valid labels for %s: %s"
             % (subject.subject_id, missing)
         )
-    return centered, channels, tuple(expected_labels), center
+    return (
+        centered,
+        channels,
+        tuple(expected_labels),
+        center,
+        tuple(float(value) for value in reference.GetOrigin()),
+    )
 
 
 def _registration_method(iterations: int, seed: int, learning_rate: float):
@@ -547,6 +553,60 @@ def _warp_binary_channels(channels: np.ndarray, reference, transform) -> np.ndar
     return result
 
 
+def _registration_to_source_transform(transform, crop_origin_lps):
+    """Map final atlas-grid points directly into the original image space."""
+    sitk = _sitk()
+    crop_offset = sitk.TranslationTransform(
+        3,
+        tuple(float(value) for value in crop_origin_lps),
+    )
+    composite = sitk.CompositeTransform(3)
+    # SimpleITK applies a composite in reverse addition order. The resulting
+    # mapping is crop_offset(transform(point)): registration in the common grid,
+    # followed by undoing the centred image's origin reset.
+    composite.AddTransform(crop_offset)
+    composite.AddTransform(transform)
+    probe = (11.0, 23.0, 37.0)
+    expected = np.asarray(transform.TransformPoint(probe), dtype=np.float64)
+    expected += np.asarray(crop_origin_lps, dtype=np.float64)
+    actual = np.asarray(composite.TransformPoint(probe), dtype=np.float64)
+    if not np.allclose(actual, expected, atol=1.0e-6, rtol=0.0):
+        raise AssertionError("unexpected SimpleITK composite-transform order")
+    return composite
+
+
+def _warp_original_binary_masks(
+    subject: Subject,
+    label_count: int,
+    reference,
+    registration_transform,
+    crop_origin_lps: Sequence[float],
+) -> np.ndarray:
+    """Resample every original mask once into the registered atlas grid."""
+    sitk = _sitk()
+    original_source = sitk.ReadImage(subject.image)
+    direct_transform = _registration_to_source_transform(
+        registration_transform,
+        crop_origin_lps,
+    )
+    shape_dhw = tuple(int(value) for value in reversed(reference.GetSize()))
+    result = np.zeros((int(label_count),) + shape_dhw, dtype=np.uint8)
+    for label, path in subject.masks:
+        original_mask = sitk.ReadImage(path)
+        _validate_geometry(original_source, original_mask, path)
+        mask = _orient_lps(original_mask)
+        warped = sitk.Resample(
+            mask,
+            reference,
+            direct_transform,
+            sitk.sitkNearestNeighbor,
+            0,
+            sitk.sitkUInt8,
+        )
+        result[int(label) - 1] = sitk.GetArrayFromImage(warped) > 0
+    return result
+
+
 def _save_array(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -601,7 +661,7 @@ def _preprocess_cross_subject(
                 raise FileNotFoundError("cached file is missing: %s" % (root / record[field]))
         return record
 
-    image, channels, valid_labels, center = _center_subject(
+    image, channels, valid_labels, center, crop_origin = _center_subject(
         subject,
         label_count,
         spacing_dhw,
@@ -619,7 +679,13 @@ def _preprocess_cross_subject(
             seed=seed,
             iterations=registration_iterations,
         )
-        channels = _warp_binary_channels(channels, atlas, transform)
+        channels = _warp_original_binary_masks(
+            subject,
+            label_count,
+            atlas,
+            transform,
+            crop_origin,
+        )
     retained = [
         label
         for label in valid_labels
@@ -645,6 +711,7 @@ def _preprocess_cross_subject(
         "spacing_dhw": [float(value) for value in spacing_dhw],
         "shape_dhw": [int(value) for value in shape_dhw],
         "crop_center_lps": list(center),
+        "crop_origin_lps": list(crop_origin),
         "center_policy": center_policy,
         "prealignment_mode": prealignment,
         "prealignment": alignment,
@@ -957,7 +1024,7 @@ def main() -> None:
             else args.prealignment
         )
         center_policy = args.center_policy
-        atlas_image, _, _, _ = _center_subject(
+        atlas_image, _, _, _, _ = _center_subject(
             by_id[atlas_subject_id],
             len(label_names),
             spacing_dhw,

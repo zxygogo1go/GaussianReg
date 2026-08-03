@@ -7,6 +7,7 @@ from prepare_head_neck_datasets import (
     _crop_center_physical,
     _cross_patient_pairs,
     _geometric_center_physical,
+    _registration_to_source_transform,
     _split_subject_ids,
 )
 
@@ -31,6 +32,41 @@ class ExternalPreprocessingTests(unittest.TestCase):
         self.assertEqual(_crop_center_physical(image, "geometric"), center)
         with self.assertRaisesRegex(ValueError, "unknown center policy"):
             _crop_center_physical(image, "labels")
+
+    def test_registration_and_crop_offset_are_composed_in_correct_order(self):
+        try:
+            import SimpleITK as sitk
+        except ImportError:
+            self.skipTest("SimpleITK is not installed")
+        transform = sitk.AffineTransform(3)
+        transform.SetMatrix((
+            1.1, 0.0, 0.0,
+            0.0, 0.9, 0.0,
+            0.0, 0.0, 1.0,
+        ))
+        transform.SetTranslation((3.0, -4.0, 5.0))
+        crop_origin = (-80.0, 120.0, -250.0)
+        composite = _registration_to_source_transform(
+            transform,
+            crop_origin,
+        )
+        point = (7.0, 11.0, 13.0)
+        expected = tuple(
+            transformed + offset
+            for transformed, offset in zip(
+                transform.TransformPoint(point),
+                crop_origin,
+            )
+        )
+        self.assertTrue(
+            all(
+                abs(actual - target) < 1.0e-6
+                for actual, target in zip(
+                    composite.TransformPoint(point),
+                    expected,
+                )
+            )
+        )
 
     def test_label_tables_and_patient_split(self):
         self.assertEqual(len(HAN_SEG_LABEL_NAMES), 30)

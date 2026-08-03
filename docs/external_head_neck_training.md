@@ -24,7 +24,9 @@ uses the label-independent image geometric centre, a `192 x 160 x 160` crop,
 training-only atlas. The 480 mm superior-inferior field of view preserves small
 superior OARs without using annotations to choose the crop; the two in-plane
 axes remain at 2 mm. Patient identities are split before atlas selection and
-pairing.
+pairing. Original masks are mapped directly to the final atlas grid in one
+nearest-neighbour resampling; cropping and prealignment are composed before
+interpolation so very small OARs are not erased by repeated resampling.
 Each moving subject is paired with three deterministic, non-self fixed
 subjects inside the same split; no pair crosses a patient split.
 
@@ -68,7 +70,8 @@ paper experiment. For labelled datasets, preprocessing also exits non-zero if
 an originally non-empty valid label becomes empty after cropping or atlas
 prealignment. `--overwrite` is required above because it replaces the earlier
 body-centred `176 x 160 x 160` preprocessing. The paired CBCT-CT output does not
-need to be regenerated. A complete forward/backward smoke test of the new
+need to be regenerated. It is also required when replacing an output created
+before single-pass label resampling. A complete forward/backward smoke test of the new
 cross-patient shape used 18.3 GB on the server A100; larger depths from 208 to
 240 exceeded the stable BF16 3D-convolution path of the installed PyTorch/CUDA
 stack despite nominal free memory.
