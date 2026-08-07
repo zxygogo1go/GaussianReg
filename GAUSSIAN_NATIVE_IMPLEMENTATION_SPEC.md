@@ -17,7 +17,10 @@ Revision v10 adds a three-stage voxel CNN that predicts bounded residual
 stationary velocities after each coarse-to-fine image warp. V11 adds a
 gradient-aware fourth stage at full resolution. These revisions are
 Gaussian-guided hybrid registration models; v9 remains the strict
-Gaussian-only ablation.
+Gaussian-only ablation. V12 introduces partial bidirectional correspondence
+and a Gaussian-first curriculum. V13 adds a final Small-Organ-Adaptive
+Gaussian Refinement (SAGR) stage that returns the local intervention to
+Gaussian primitives.
 
 ## 2. Coordinate convention
 
@@ -429,7 +432,23 @@ anatomy supervision starts at epoch 31 and ramps only from 0.05 to 0.40, while
 moving and fixed intensities are augmented independently. This curriculum is a
 training strategy, not a third prediction module.
 
-## 6. V11/V12 experimental configuration
+Revision v13 retains the complete v12 global path and adds SAGR after its
+full-resolution deformation. SAGR predicts image-derived priority on the
+finest fixed Gaussian set, selects a fixed compute budget, densifies each
+selected primitive into one centre and eight corner children, and performs a
+second within-parent Gaussian correspondence against the globally warped
+moving image. The child translations are rasterized into a bounded residual
+SVF, integrated by scaling-and-squaring, and composed with the global
+deformation. Both its direct gain and learned velocity output are initialized
+to zero, so v13 exactly reproduces v12 before optimization.
+
+Small-organ masks supervise only the priority logits during training. They are
+not accepted by `model.forward` and are absent at validation and inference.
+The final composed flow receives the strongest anatomy deep-supervision weight,
+while local SVF smoothness, energy, inverse consistency, and the final Jacobian
+barrier constrain the refinement.
+
+## 6. V11/V12/V13 experimental configuration
 
 - Input: `128×160×160`, 1.5 mm isotropic.
 - Gaussian counts: `64/256/1024`.
@@ -474,6 +493,17 @@ comparison: transport is bidirectional unbalanced Sinkhorn with dustbin mass
 synthetic-pretrain/refinement-unfreeze/anatomy-start boundaries described above;
 the architecture width and four-stage refinement capacity remain unchanged.
 
+V13 keeps those global settings. HNTS-MRG24 selects 48 finest parents and
+creates nine children per parent; HaN-Seg and SegRap2023 select 64 parents.
+The resulting production model has 5,597,405 trainable parameters, an increase
+of 216,615 over v12.
+Local child correspondence operates at factor two, residual translation is
+bounded to 2.5--3.0 mm, and the local SVF is integrated with seven
+scaling-and-squaring steps. HaN-Seg and SegRap2023 use their configured
+small-organ masks only for delayed Gaussian-priority supervision.
+Head-Neck-CBCT-CT keeps SAGR disabled because its current preprocessed copy has
+no anatomical labels for validating the small-organ endpoint.
+
 ## 7. Required comparisons and ablations
 
 Main comparison:
@@ -484,6 +514,7 @@ Main comparison:
 - segmentation-supervised Gaussian-guided v10 model;
 - small-target-refined Gaussian-guided v11 model.
 - partial-correspondence Gaussian-first v12 model.
+- small-organ-adaptive Gaussian-refined v13 model.
 
 Required ablations:
 
@@ -505,6 +536,12 @@ Required ablations:
 - v12 forced row-softmax versus partial Sinkhorn;
 - v12 without synthetic Gaussian pretraining;
 - v12 without delayed weak anatomy supervision.
+- v13 without adaptive priority (fixed nodes and unit refinement gates);
+- v13 without child densification;
+- v13 without local child correspondence;
+- v13 without Gaussian-priority supervision;
+- v13 local residual composition versus raw displacement addition as an
+  experiment-only ablation.
 
 The implementation exposes `model.motion_mode` (`translation`, `se3`, or
 `affine`), `model.integration_mode` (`direct` or `svf`), and a zero

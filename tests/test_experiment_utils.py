@@ -30,7 +30,9 @@ from train_registration import (
     _configure_training_stage,
     _fail_fast_reason,
     _make_synthetic_deformation_pair,
+    _ordered_label_union,
     _sample_flow_mm_at_centers,
+    _small_organ_priority_loss,
     _supervised_anatomy_factor,
     _supervised_anatomy_loss,
     _synthetic_deformation_probability,
@@ -619,6 +621,119 @@ class ExperimentUtilityTests(unittest.TestCase):
             _supervised_anatomy_factor(config, 3),
             1.0,
         )
+
+    def test_mixed_loaded_labels_and_small_organ_priority_loss(self):
+        loaded_labels = _ordered_label_union((2, 9), (3, 8))
+        self.assertEqual(loaded_labels, (2, 9, 3, 8))
+        fixed_seg = torch.zeros(1, 4, 8, 8, 8)
+        fixed_seg[:, 2, 2:5, 2:5, 2:5] = 1.0
+        fixed_seg[:, 3, 5:7, 5:7, 5:7] = 1.0
+        centers = torch.tensor(
+            [[[2.0, 2.0, 2.0], [4.0, 4.0, 4.0], [6.0, 6.0, 6.0]]]
+        )
+        logits = torch.zeros(1, 3, requires_grad=True)
+        output = {
+            "flow": torch.zeros(1, 3, 8, 8, 8),
+            "fixed_decomposition": {
+                "levels": [object(), object(), type("Fine", (), {"centers_mm": centers})()],
+                "extent_mm": torch.tensor([[7.0, 7.0, 7.0]]),
+            },
+            "small_organ_refinement": {
+                "priority_logits": logits,
+                "selected_parent_indices": torch.tensor([[0, 2]]),
+            },
+        }
+        terms = _small_organ_priority_loss(
+            output,
+            fixed_seg,
+            torch.tensor([[True, True, True, True]]),
+            {
+                "enabled": True,
+                "supervision_labels": [3, 8],
+                "_priority_dilation_kernel": [1, 1, 1],
+            },
+            loaded_labels,
+        )
+        self.assertTrue(torch.isfinite(terms["small_organ_priority"]))
+        self.assertGreater(
+            float(terms["small_organ_priority_target_fraction"]),
+            0.0,
+        )
+        self.assertGreater(
+            float(terms["small_organ_selected_target_recall"]),
+            0.0,
+        )
+        terms["small_organ_priority"].backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertGreater(float(logits.grad.abs().sum()), 0.0)
+
+    def test_v13_builder_adds_sagr_and_freezes_it_during_pretrain(self):
+        config = {
+            "data": {
+                "shape_dhw": [32, 32, 32],
+                "spacing_dhw": [1.5, 1.5, 1.5],
+            },
+            "model": {
+                "architecture_revision": "gaussian_native_v13",
+                "root_grid_shape": [2, 2, 2],
+                "feature_dim": 24,
+                "hidden_dim": 32,
+                "graph_heads": 4,
+                "graph_neighbors": 4,
+                "graph_blocks_per_level": 1,
+                "samples_per_axis": 2,
+                "pyramid_factors": [8, 4, 2],
+                "sinkhorn_iterations": 3,
+                "parent_candidates": 2,
+                "velocity_hidden_dim": 48,
+                "raster_chunk": 16,
+                "integration_steps": 3,
+                "geometry_mode": "anchored",
+                "transport_mode": "unbalanced_sinkhorn",
+                "marginal_relaxation": 0.9,
+                "mutual_transport": True,
+                "correspondence_score_mode": "contextual_residual",
+                "appearance_weight": 0.8,
+                "feature_residual_weight": 0.1,
+                "pair_score_hidden_dim": 32,
+                "pair_context_dim": 32,
+                "pair_score_heads": 4,
+                "pair_fusion_hidden_dim": 48,
+                "dustbin_mass": 0.18,
+                "motion_mode": "translation",
+                "refinement_factors": [8, 4, 2, 1],
+                "refinement_channels": [8, 8, 8, 8],
+                "refinement_blocks_per_stage": [1, 1, 1, 1],
+                "refinement_maximum_residual_vox": [1.0, 1.0, 1.0, 0.5],
+                "small_organ_selected_parents": 4,
+                "small_organ_children_per_parent": 9,
+                "small_organ_descriptor_dim": 8,
+                "small_organ_hidden_dim": 16,
+                "small_organ_raster_chunk": 4,
+            },
+            "synthetic_deformation": {"enabled": False},
+            "small_organ_refinement": {
+                "enabled": True,
+                "supervision_labels": [3],
+                "start_epoch": 3,
+                "weight_factor_start": 0.1,
+                "weight_factor_end": 0.5,
+                "weight_ramp_epochs": 3,
+            },
+            "optimization": {
+                "gaussian_pretrain_epochs": 2,
+                "freeze_refinement_during_gaussian_pretrain": True,
+            },
+        }
+        model = build_model(config)
+        self.assertEqual(model.architecture_revision, "gaussian_native_v13")
+        self.assertIsNotNone(model.small_organ_refiner)
+        pretrain = _configure_training_stage(model, config, 1)
+        self.assertFalse(pretrain["small_organ_refinement_trainable"])
+        self.assertEqual(pretrain["small_organ_refinement_factor"], 0.0)
+        joint = _configure_training_stage(model, config, 3)
+        self.assertTrue(joint["small_organ_refinement_trainable"])
+        self.assertAlmostEqual(joint["small_organ_refinement_factor"], 0.1)
 
     def test_v11_builder_adds_full_resolution_gradient_stage(self):
         config = {

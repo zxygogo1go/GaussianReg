@@ -12,8 +12,13 @@ from torch import nn
 from .correspondence import HierarchicalGaussianCorrespondence
 from .decomposition import HierarchicalGaussianDecomposer
 from .encoding import HierarchicalGaussianEncoder
-from .integration import ScalingAndSquaring, warp_tensor
+from .integration import (
+    ScalingAndSquaring,
+    compose_displacements,
+    warp_tensor,
+)
 from .refinement import GaussianGuidedResidualPyramid
+from .small_organ_refinement import SmallOrganAdaptiveGaussianRefiner
 from .velocity import (
     GaussianVelocityHead,
     HierarchicalGaussianVelocitySynthesis,
@@ -90,6 +95,24 @@ class GaussianNativeRegistration(nn.Module):
         learned_translation_fractions: Optional[Sequence[float]] = (0.20, 0.12, 0.08),
         max_rotation_radians: Optional[float] = None,
         max_strain: Optional[float] = None,
+        small_organ_refinement_enabled: bool = True,
+        small_organ_selected_parents: int = 48,
+        small_organ_children_per_parent: int = 9,
+        small_organ_descriptor_dim: int = 64,
+        small_organ_hidden_dim: int = 128,
+        small_organ_search_radius_fraction: float = 0.45,
+        small_organ_minimum_search_radius_mm: float = 2.0,
+        small_organ_maximum_search_radius_mm: float = 6.0,
+        small_organ_child_scale_fraction: float = 0.35,
+        small_organ_maximum_residual_mm: float = 3.0,
+        small_organ_synthesis_factor: int = 2,
+        small_organ_match_temperature: float = 0.15,
+        small_organ_position_weight: float = 0.10,
+        small_organ_mismatch_prior_weight: float = 0.50,
+        small_organ_raster_chunk: int = 32,
+        small_organ_cutoff_sigma: float = 3.0,
+        small_organ_adaptive_priority: bool = True,
+        small_organ_local_correspondence: bool = True,
     ) -> None:
         super().__init__()
         self.architecture_revision = str(architecture_revision).strip().lower()
@@ -106,6 +129,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }:
             raise ValueError("unsupported Gaussian-native architecture revision")
         use_calibrated_motion = self.architecture_revision in {
@@ -120,6 +144,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }
         use_stable_motion_basis = self.architecture_revision in {
             "gaussian_native_v3",
@@ -132,6 +157,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }
         use_v3_motion = self.architecture_revision == "gaussian_native_v3"
         use_anatomical_motion = self.architecture_revision in {
@@ -144,6 +170,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }
         use_sparse_appearance_motion = self.architecture_revision in {
             "gaussian_native_v5",
@@ -154,6 +181,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }
         use_v5_motion = self.architecture_revision == "gaussian_native_v5"
         use_residual_pair_motion = self.architecture_revision in {
@@ -163,6 +191,7 @@ class GaussianNativeRegistration(nn.Module):
             "gaussian_native_v10",
             "gaussian_native_v11",
             "gaussian_native_v12",
+            "gaussian_native_v13",
         }
         use_pyramid_refinement = (
             self.architecture_revision
@@ -170,10 +199,16 @@ class GaussianNativeRegistration(nn.Module):
                 "gaussian_native_v10",
                 "gaussian_native_v11",
                 "gaussian_native_v12",
+                "gaussian_native_v13",
             }
         )
         use_bidirectional_partial_transport = (
-            self.architecture_revision == "gaussian_native_v12"
+            self.architecture_revision
+            in {"gaussian_native_v12", "gaussian_native_v13"}
+        )
+        use_small_organ_refinement = bool(
+            self.architecture_revision == "gaussian_native_v13"
+            and small_organ_refinement_enabled
         )
         if mutual_transport is None:
             mutual_transport = (
@@ -319,6 +354,45 @@ class GaussianNativeRegistration(nn.Module):
             if use_pyramid_refinement
             else None
         )
+        self.small_organ_refiner = (
+            SmallOrganAdaptiveGaussianRefiner(
+                feature_dim=feature_dim,
+                selected_parents=small_organ_selected_parents,
+                children_per_parent=small_organ_children_per_parent,
+                descriptor_dim=small_organ_descriptor_dim,
+                hidden_dim=small_organ_hidden_dim,
+                search_radius_fraction=(
+                    small_organ_search_radius_fraction
+                ),
+                minimum_search_radius_mm=(
+                    small_organ_minimum_search_radius_mm
+                ),
+                maximum_search_radius_mm=(
+                    small_organ_maximum_search_radius_mm
+                ),
+                child_scale_fraction=(
+                    small_organ_child_scale_fraction
+                ),
+                maximum_residual_mm=(
+                    small_organ_maximum_residual_mm
+                ),
+                synthesis_factor=small_organ_synthesis_factor,
+                match_temperature=small_organ_match_temperature,
+                position_weight=small_organ_position_weight,
+                mismatch_prior_weight=(
+                    small_organ_mismatch_prior_weight
+                ),
+                raster_chunk=small_organ_raster_chunk,
+                cutoff_sigma=small_organ_cutoff_sigma,
+                integration_steps=integration_steps,
+                adaptive_priority=small_organ_adaptive_priority,
+                local_correspondence=(
+                    small_organ_local_correspondence
+                ),
+            )
+            if use_small_organ_refinement
+            else None
+        )
 
     def set_correspondence_temperature(self, temperature: float) -> None:
         self.correspondence.set_temperature(temperature)
@@ -425,6 +499,28 @@ class GaussianNativeRegistration(nn.Module):
                 else:
                     flow = velocity_vox
                     inverse_flow = -velocity_vox
+        global_flow = flow
+        global_inverse_flow = inverse_flow
+        small_organ_refinement = None
+        if self.small_organ_refiner is not None:
+            with _autocast_disabled(moving.device):
+                small_organ_refinement = self.small_organ_refiner(
+                    moving.float(),
+                    fixed.float(),
+                    global_flow.float(),
+                    fixed_levels[-1],
+                    matches[-1],
+                    spacing.float(),
+                    fixed_decomposition["extent_mm"].float(),
+                )
+                flow = compose_displacements(
+                    small_organ_refinement["local_flow"],
+                    global_flow.float(),
+                )
+                inverse_flow = compose_displacements(
+                    global_inverse_flow.float(),
+                    small_organ_refinement["local_inverse_flow"],
+                )
         with _autocast_disabled(moving.device):
             warped = warp_tensor(moving.float(), flow, padding_mode="zeros")
             inverse_warped = warp_tensor(fixed.float(), inverse_flow, padding_mode="zeros")
@@ -458,6 +554,26 @@ class GaussianNativeRegistration(nn.Module):
                     ],
                     "pyramid_flow": refinement["pyramid_flow"],
                     "pyramid_warped": refinement["pyramid_warped"],
+                }
+            )
+        if small_organ_refinement is not None:
+            result.update(
+                {
+                    "global_flow": global_flow,
+                    "global_inverse_flow": global_inverse_flow,
+                    "small_organ_refinement": small_organ_refinement,
+                    "local_residual_velocity_mm": (
+                        small_organ_refinement["local_velocity_mm"]
+                    ),
+                    "local_residual_velocity_vox": (
+                        small_organ_refinement["local_velocity_vox"]
+                    ),
+                    "local_residual_flow": (
+                        small_organ_refinement["local_flow"]
+                    ),
+                    "local_inverse_flow": (
+                        small_organ_refinement["local_inverse_flow"]
+                    ),
                 }
             )
         return result

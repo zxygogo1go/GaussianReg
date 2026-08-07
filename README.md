@@ -30,12 +30,18 @@ factor 8 → warp → factor 4 → warp → factor 2 → warp
         ↓
 gradient-aware factor 1 boundary refinement
         ↓
-Full-resolution scaling-and-squaring
+Global full-resolution scaling-and-squaring
+        ↓
+Small-organ-adaptive Gaussian priority and densification
+        ↓
+Local child-Gaussian correspondence and residual SVF
+        ↓
+Local scaling-and-squaring + deformation composition
         ↓
 Dense diffeomorphic deformation
 ```
 
-The implementation is organized around two research modules:
+The implementation is organized around three research modules:
 
 1. **Hierarchical Gaussian Representation and Correspondence (HGRC)** encodes
    fixed, mass-conserving Gaussian anatomy hierarchies and learns explicit
@@ -49,12 +55,20 @@ The implementation is organized around two research modules:
    image-warped residual SVF refinement at factors 8, 4, and 2. V11 adds a
    gradient-aware factor-one stage before the accumulated full-resolution
    stationary velocity is integrated into a diffeomorphism.
+3. **Small-Organ-Adaptive Gaussian Refinement (SAGR)** predicts image-only
+   refinement priority on the finest Gaussian set, spends a fixed compute
+   budget on selected parents, splits them into child Gaussians, performs a
+   second local Gaussian correspondence, and synthesizes a bounded residual
+   SVF. The residual diffeomorphism is composed with the global transform.
+   Fixed small-organ masks teach priority during training but are never model
+   inputs at validation or inference.
 
 There is no SACB branch, Gaussian/dense gate, or standalone confidence module
-in the new prediction path. Revisions v10/v11 deliberately add a conventional
+in the new prediction path. Revisions v10--v12 deliberately add a conventional
 voxel residual refiner after Gaussian correspondence; it is therefore a
-Gaussian-guided hybrid rather than a strictly Gaussian-only model. Revision v9
-is retained as the strict Gaussian-only unsupervised ablation.
+Gaussian-guided hybrid rather than a strictly Gaussian-only model. V13 moves
+the final small-organ intervention back to Gaussian primitives, while v9 is
+retained as the strict Gaussian-only unsupervised ablation.
 
 ## Environment
 
@@ -101,12 +115,19 @@ every exclusion recorded in `dataset_summary.json`.
 Run from the repository root on one selected A100. This is an explicit command;
 no shell launch wrapper is required.
 
-The current experimental revision is v12. It retains v11's contextual matcher
-and factor-8/4/2/1 residual image pyramid, but replaces forced row-softmax
-matching with bidirectional KL-relaxed Sinkhorn transport and an explicit
-unmatched dustbin. Match evidence is the product of support concentration and
-the transported real mass, so unmatched longitudinal anatomy cannot generate a
-full-strength displacement merely because its remaining candidates are sharp.
+The current experimental revision is v13. It retains v12's contextual matcher,
+bidirectional KL-relaxed Sinkhorn transport with an unmatched dustbin, and
+factor-8/4/2/1 residual image pyramid. Match evidence is the product of support
+concentration and transported real mass, so unmatched longitudinal anatomy
+cannot generate a full-strength displacement merely because its remaining
+candidates are sharp.
+
+V13 adds SAGR after the global V12 deformation. At initialization its direct
+gain and velocity head are exactly zero, so the composed deformation equals
+V12. Training-only small-organ labels supervise Gaussian selection; the local
+correspondence and residual deformation still consume only image/Gaussian
+features. The final flow is obtained by transformation composition, not raw
+DVF addition.
 
 V12 uses a Gaussian-first curriculum. Epochs 1--15 use known synthetic
 diffeomorphic pairs, the zero-initialized dense residual pyramid is frozen
@@ -120,7 +141,7 @@ First run one production-shape forward/backward memory audit:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python smoke_gaussian_native.py \
-  --config configs/gaussian_native_v12_hntsmrg24.json \
+  --config configs/gaussian_native_v13_hntsmrg24.json \
   --device cuda:0
 ```
 
@@ -129,17 +150,19 @@ experiment metadata.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v12_hntsmrg24.json \
+  --config configs/gaussian_native_v13_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v12_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v13_hntsmrg24_seed2026 \
   --device cuda:0
 ```
 
-The v12 model contains 64/256/1024 Gaussian primitives and 5,380,790 trainable
-parameters. A full `(128,160,160)` A100 forward/backward smoke test uses about
-10.3 GiB peak allocated GPU memory. Training uses:
+The V12 backbone contains 64/256/1024 global Gaussian primitives. V13 adds a
+fixed budget of 48 selected parents x 9 local children for HNTS-MRG24; HaN-Seg
+and SegRap use 64 x 9. The production V13 model has 5,597,405 trainable
+parameters (216,615 more than V12); record the peak A100 allocation from the
+V13 smoke before training. Training uses:
 
 - bidirectional multi-scale LNCC and normalized-gradient similarity;
 - an anchored, mass-conserving Gaussian hierarchy without learned geometry
@@ -150,6 +173,9 @@ parameters. A full `(128,160,160)` A100 forward/backward smoke test uses about
 - sequential factor-8/4/2/1 residual SVF refinement after image warping;
 - gradient features in every residual stage, including full resolution;
 - delayed weak GTVp-weighted Dice, boundary, centroid, and inverse supervision;
+- training-only small-target Gaussian-priority supervision;
+- adaptive child-Gaussian densification and local mutual correspondence;
+- bounded local residual SVF integration and deformation composition;
 - SVF smoothness, inverse consistency, and a Jacobian safety barrier;
 - independent longitudinal MRI intensity and synchronized image/label flip
   augmentation.
@@ -165,11 +191,13 @@ velocity and accumulated flow magnitude at every pyramid stage. V12 logs real
 transport mass, fixed/moving unmatched mass, relaxed marginal error, and the
 weighted Dice, boundary, centroid, and inverse-Dice terms. Every residual
 velocity head is exactly zero before the first update and should then become
-nonzero.
+nonzero. V13 additionally logs Gaussian priority, selected priority, child
+transport entropy, child velocity, local SVF/flow magnitude, coverage, direct
+gain, priority loss, and selected-target fraction.
 Clearly harmful or stalled runs are stopped by configured fail-fast rules and
 retain a `failed_epoch_XXXX.pt` checkpoint with the exact reason.
 
-The v12 best checkpoint is selected by validation mean Dice and written as
+The V13 best checkpoint is selected by validation mean Dice and written as
 `best_validation_dice.pt` only when Dice improves over the unregistered pair,
 NCC degradation is below the configured tolerance, and the negative Jacobian
 ratio is at most 1%. Resume only with the same configuration and manifest
@@ -177,13 +205,13 @@ hashes:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train_gaussian_native.py \
-  --config configs/gaussian_native_v12_hntsmrg24.json \
+  --config configs/gaussian_native_v13_hntsmrg24.json \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --train-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v12_hntsmrg24_seed2026 \
+  --output-dir runs/gaussian_native_v13_hntsmrg24_seed2026 \
   --device cuda:0 \
-  --resume runs/gaussian_native_v12_hntsmrg24_seed2026/latest.pt
+  --resume runs/gaussian_native_v13_hntsmrg24_seed2026/latest.pt
 ```
 
 ## Evaluation
@@ -192,10 +220,10 @@ Evaluate the held-out test set after validation-based model selection:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v12_hntsmrg24_seed2026/best_validation_dice.pt \
+  --checkpoint runs/gaussian_native_v13_hntsmrg24_seed2026/best_validation_dice.pt \
   --data-root /path/to/HNTSMRG24_gaussian_native_preprocessed \
   --manifest /path/to/HNTSMRG24_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v12_hntsmrg24_seed2026 \
+  --output-dir results/gaussian_native_v13_hntsmrg24_seed2026 \
   --device cuda:0 \
   --save-predictions
 ```

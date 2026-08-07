@@ -288,6 +288,7 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
         "gaussian_native_v10",
         "gaussian_native_v11",
         "gaussian_native_v12",
+        "gaussian_native_v13",
     }
     direct_limits = model.get(
         "direct_displacement_limits_mm",
@@ -434,6 +435,60 @@ def build_model(config: Mapping[str, object]) -> nn.Module:
             None
             if model.get("max_strain") is None
             else float(model["max_strain"])
+        ),
+        small_organ_refinement_enabled=bool(
+            model.get("small_organ_refinement_enabled", True)
+        ),
+        small_organ_selected_parents=int(
+            model.get("small_organ_selected_parents", 48)
+        ),
+        small_organ_children_per_parent=int(
+            model.get("small_organ_children_per_parent", 9)
+        ),
+        small_organ_descriptor_dim=int(
+            model.get("small_organ_descriptor_dim", 64)
+        ),
+        small_organ_hidden_dim=int(
+            model.get("small_organ_hidden_dim", 128)
+        ),
+        small_organ_search_radius_fraction=float(
+            model.get("small_organ_search_radius_fraction", 0.45)
+        ),
+        small_organ_minimum_search_radius_mm=float(
+            model.get("small_organ_minimum_search_radius_mm", 2.0)
+        ),
+        small_organ_maximum_search_radius_mm=float(
+            model.get("small_organ_maximum_search_radius_mm", 6.0)
+        ),
+        small_organ_child_scale_fraction=float(
+            model.get("small_organ_child_scale_fraction", 0.35)
+        ),
+        small_organ_maximum_residual_mm=float(
+            model.get("small_organ_maximum_residual_mm", 3.0)
+        ),
+        small_organ_synthesis_factor=int(
+            model.get("small_organ_synthesis_factor", 2)
+        ),
+        small_organ_match_temperature=float(
+            model.get("small_organ_match_temperature", 0.15)
+        ),
+        small_organ_position_weight=float(
+            model.get("small_organ_position_weight", 0.10)
+        ),
+        small_organ_mismatch_prior_weight=float(
+            model.get("small_organ_mismatch_prior_weight", 0.50)
+        ),
+        small_organ_raster_chunk=int(
+            model.get("small_organ_raster_chunk", 32)
+        ),
+        small_organ_cutoff_sigma=float(
+            model.get("small_organ_cutoff_sigma", 3.0)
+        ),
+        small_organ_adaptive_priority=bool(
+            model.get("small_organ_adaptive_priority", True)
+        ),
+        small_organ_local_correspondence=bool(
+            model.get("small_organ_local_correspondence", True)
         ),
     )
 
@@ -653,6 +708,56 @@ def output_diagnostics(output: Mapping[str, object]) -> Dict[str, float]:
     for index, flow in enumerate(output.get("pyramid_flow", ())):
         diagnostics["pyramid_flow_l%d_abs_vox" % index] = float(
             flow.detach().float().abs().mean().cpu()
+        )
+    small_organ = output.get("small_organ_refinement")
+    if small_organ is not None:
+        diagnostics["small_organ_priority_mean"] = float(
+            small_organ["priority"].detach().float().mean().cpu()
+        )
+        diagnostics["small_organ_priority_max"] = float(
+            small_organ["priority"].detach().float().max().cpu()
+        )
+        diagnostics["small_organ_selected_priority"] = float(
+            small_organ["selected_priority"].detach().float().mean().cpu()
+        )
+        diagnostics["small_organ_transport_entropy"] = float(
+            small_organ["local_transport_entropy"]
+            .detach()
+            .float()
+            .mean()
+            .cpu()
+        )
+        diagnostics["small_organ_child_velocity_mm"] = float(
+            torch.linalg.vector_norm(
+                small_organ["child_velocity_mm"].detach().float(),
+                dim=-1,
+            ).mean().cpu()
+        )
+        diagnostics["small_organ_local_velocity_abs_mm"] = float(
+            small_organ["local_velocity_mm"]
+            .detach()
+            .float()
+            .abs()
+            .mean()
+            .cpu()
+        )
+        diagnostics["small_organ_local_flow_abs_vox"] = float(
+            small_organ["local_flow"]
+            .detach()
+            .float()
+            .abs()
+            .mean()
+            .cpu()
+        )
+        diagnostics["small_organ_coverage"] = float(
+            small_organ["local_coverage_low"]
+            .detach()
+            .float()
+            .mean()
+            .cpu()
+        )
+        diagnostics["small_organ_direct_gain"] = float(
+            small_organ["direct_gain"].detach().float().cpu()
         )
     fixed_levels = output.get("fixed_decomposition", {}).get("levels", ())
     for index, level in enumerate(fixed_levels):

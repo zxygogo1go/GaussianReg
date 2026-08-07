@@ -1,0 +1,13 @@
+{
+  "extends": "gaussian_native_v12_head_neck_cbct_ct.json",
+  "schema_version": 13,
+  "experiment_name": "gaussian_native_v13_head_neck_cbct_ct_no_sagr",
+  "model": {
+    "architecture_revision": "gaussian_native_v13",
+    "small_organ_refinement_enabled": false
+  },
+  "small_organ_refinement": {
+    "enabled": false,
+    "supervision_labels": []
+  }
+}

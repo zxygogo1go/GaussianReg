@@ -1,0 +1,46 @@
+{
+  "extends": "gaussian_native_v12_segrap2023.json",
+  "schema_version": 13,
+  "experiment_name": "gaussian_native_v13_segrap2023_sagr",
+  "model": {
+    "architecture_revision": "gaussian_native_v13",
+    "small_organ_refinement_enabled": true,
+    "small_organ_selected_parents": 64,
+    "small_organ_children_per_parent": 9,
+    "small_organ_descriptor_dim": 96,
+    "small_organ_hidden_dim": 192,
+    "small_organ_search_radius_fraction": 0.5,
+    "small_organ_minimum_search_radius_mm": 2.0,
+    "small_organ_maximum_search_radius_mm": 6.0,
+    "small_organ_child_scale_fraction": 0.35,
+    "small_organ_maximum_residual_mm": 3.0,
+    "small_organ_synthesis_factor": 2,
+    "small_organ_match_temperature": 0.15,
+    "small_organ_position_weight": 0.1,
+    "small_organ_mismatch_prior_weight": 0.5,
+    "small_organ_raster_chunk": 32,
+    "small_organ_cutoff_sigma": 3.0,
+    "small_organ_adaptive_priority": true,
+    "small_organ_local_correspondence": true
+  },
+  "loss": {
+    "local_velocity_smoothness_weight": 0.5,
+    "local_velocity_energy_weight": 0.5
+  },
+  "supervised_anatomy": {
+    "deep_supervision_weights": [0.08, 0.12, 0.18, 0.22, 0.4]
+  },
+  "small_organ_refinement": {
+    "enabled": true,
+    "supervision_labels": [3, 4, 5, 6, 7, 13, 14, 18, 19, 26, 27, 32, 42, 43, 44, 45],
+    "priority_loss_weight": 0.25,
+    "priority_dilation_mm": 6.0,
+    "start_epoch": 31,
+    "weight_factor_start": 0.1,
+    "weight_factor_end": 0.6,
+    "weight_ramp_epochs": 25
+  },
+  "optimization": {
+    "epochs": 200
+  }
+}

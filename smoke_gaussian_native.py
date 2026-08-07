@@ -6,6 +6,7 @@ import argparse
 import json
 import time
 
+import numpy as np
 import torch
 
 from experiment_utils import (
@@ -19,6 +20,8 @@ from experiment_utils import (
 )
 from train_registration import (
     _make_synthetic_deformation_pair,
+    _ordered_label_union,
+    _small_organ_priority_loss,
     _supervised_anatomy_factor,
     _supervised_anatomy_loss,
     _synthetic_supervision,
@@ -29,7 +32,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        default="configs/gaussian_native_v12_hntsmrg24.json",
+        default="configs/gaussian_native_v13_hntsmrg24.json",
     )
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -71,10 +74,29 @@ def main() -> None:
     supervised_config = dict(
         config.get("supervised_anatomy", {})
     )
+    small_organ_config = dict(
+        config.get("small_organ_refinement", {})
+    )
+    supervised_labels = tuple(
+        int(value)
+        for value in supervised_config.get("labels", ())
+    )
+    small_organ_labels = tuple(
+        int(value)
+        for value in small_organ_config.get("supervision_labels", ())
+    )
+    training_labels = _ordered_label_union(
+        supervised_labels
+        if bool(supervised_config.get("enabled", False))
+        else (),
+        small_organ_labels
+        if bool(small_organ_config.get("enabled", False))
+        else (),
+    )
     moving_seg = None
     fixed_seg = None
     response_valid = None
-    if bool(supervised_config.get("enabled", False)):
+    if training_labels:
         moving_seg = torch.zeros(
             (1, 1, *shape),
             device=device,
@@ -111,14 +133,42 @@ def main() -> None:
             h0 // 2 + 1:h0 + 1,
             w0 // 2:w0,
         ] = 2
-        labels = tuple(
-            int(value)
-            for value in supervised_config.get("labels", (1, 2))
-        )
+        if small_organ_labels:
+            small_label = int(small_organ_labels[0])
+            moving_seg[
+                :,
+                :,
+                d0 // 2 : d0 // 2 + 3,
+                h0 // 2 : h0 // 2 + 3,
+                w0 // 2 : w0 // 2 + 3,
+            ] = small_label
+            fixed_seg[
+                :,
+                :,
+                d0 // 2 + 1 : d0 // 2 + 4,
+                h0 // 2 : h0 // 2 + 3,
+                w0 // 2 : w0 // 2 + 3,
+            ] = small_label
         response_valid = torch.tensor(
-            [[label in (1, 2) for label in labels]],
+            [[label in (1, 2, *small_organ_labels) for label in training_labels]],
             device=device,
             dtype=torch.bool,
+        )
+        spacing_values = tuple(
+            float(value)
+            for value in dict(config.get("data", {})).get(
+                "spacing_dhw",
+                (1.5, 1.5, 1.5),
+            )
+        )
+        dilation_mm = float(
+            small_organ_config.get("priority_dilation_mm", 0.0)
+        )
+        small_organ_config["_priority_dilation_kernel"] = tuple(
+            2 * int(np.ceil(dilation_mm / spacing)) + 1
+            if dilation_mm > 0.0
+            else 1
+            for spacing in spacing_values
         )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -156,13 +206,14 @@ def main() -> None:
                 )
                 * terms["synthetic_correspondence"]
             )
-        if moving_seg is not None:
+        if moving_seg is not None and bool(supervised_config.get("enabled", False)):
             supervised_terms = _supervised_anatomy_loss(
                 output,
                 moving_seg,
                 fixed_seg,
                 response_valid,
                 supervised_config,
+                loaded_labels=training_labels,
             )
             terms.update(supervised_terms)
             factor = _supervised_anatomy_factor(
@@ -203,6 +254,25 @@ def main() -> None:
                     * terms["supervised_inverse_dice"]
                 )
             )
+        if moving_seg is not None and bool(small_organ_config.get("enabled", False)):
+            small_organ_terms = _small_organ_priority_loss(
+                output,
+                fixed_seg,
+                response_valid,
+                small_organ_config,
+                training_labels,
+            )
+            terms.update(small_organ_terms)
+            factor = _supervised_anatomy_factor(
+                small_organ_config,
+                epoch=int(small_organ_config.get("start_epoch", 1)),
+            )
+            terms["total"] = (
+                terms["total"]
+                + factor
+                * float(small_organ_config.get("priority_loss_weight", 0.0))
+                * terms["small_organ_priority"]
+            )
     terms["total"].backward()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -237,6 +307,22 @@ def main() -> None:
             for value in pair_residual_gradient_l1
         )
     )
+    small_organ_refiner = getattr(model, "small_organ_refiner", None)
+    small_organ_priority_gradient_l1 = None
+    small_organ_velocity_gradient_l1 = None
+    if small_organ_refiner is not None:
+        priority_gradient = small_organ_refiner.priority_head[-1].weight.grad
+        velocity_gradient = small_organ_refiner.velocity_head[-1].weight.grad
+        small_organ_priority_gradient_l1 = (
+            None
+            if priority_gradient is None
+            else float(priority_gradient.detach().float().abs().sum().cpu())
+        )
+        small_organ_velocity_gradient_l1 = (
+            None
+            if velocity_gradient is None
+            else float(velocity_gradient.detach().float().abs().sum().cpu())
+        )
     result = {
         "device": str(device),
         "shape_dhw": list(shape),
@@ -246,6 +332,8 @@ def main() -> None:
         "amp_cache_enabled": amp_cache_enabled,
         "pair_residual_gradient_l1": pair_residual_gradient_l1,
         "pair_residual_trainable": pair_residual_trainable,
+        "small_organ_priority_gradient_l1": small_organ_priority_gradient_l1,
+        "small_organ_velocity_gradient_l1": small_organ_velocity_gradient_l1,
         "seconds": seconds,
         "peak_gpu_memory_mb": (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 2))
@@ -281,6 +369,7 @@ def main() -> None:
                     "learned_translation_",
                     "pyramid_residual_",
                     "pyramid_flow_",
+                    "small_organ_",
                 )
             )
         },
@@ -291,6 +380,15 @@ def main() -> None:
     if not pair_residual_trainable:
         raise RuntimeError(
             "pair residual scorer is disconnected from the training objective"
+        )
+    if small_organ_refiner is not None and (
+        small_organ_priority_gradient_l1 is None
+        or small_organ_priority_gradient_l1 <= 0.0
+        or small_organ_velocity_gradient_l1 is None
+        or small_organ_velocity_gradient_l1 <= 0.0
+    ):
+        raise RuntimeError(
+            "SAGR priority or velocity head is disconnected from training"
         )
 
 

@@ -89,13 +89,13 @@ Run the datasets sequentially on the single A100. HaN-Seg:
 ```bash
 nohup env CUDA_VISIBLE_DEVICES=0 \
   /home/student3/miniconda3/envs/SACB/bin/python train_gaussian_native.py \
-  --config configs/gaussian_native_v12_han_seg.json \
+  --config configs/gaussian_native_v13_han_seg.json \
   --data-root /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed \
   --train-manifest /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v12_han_seg_seed2026 \
+  --output-dir runs/gaussian_native_v13_han_seg_seed2026 \
   --device cuda:0 \
-  > logs/gaussian_native_v12_han_seg_seed2026.log 2>&1 &
+  > logs/gaussian_native_v13_han_seg_seed2026.log 2>&1 &
 ```
 
 SegRap2023:
@@ -103,13 +103,13 @@ SegRap2023:
 ```bash
 nohup env CUDA_VISIBLE_DEVICES=0 \
   /home/student3/miniconda3/envs/SACB/bin/python train_gaussian_native.py \
-  --config configs/gaussian_native_v12_segrap2023.json \
+  --config configs/gaussian_native_v13_segrap2023.json \
   --data-root /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed \
   --train-manifest /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v12_segrap2023_seed2026 \
+  --output-dir runs/gaussian_native_v13_segrap2023_seed2026 \
   --device cuda:0 \
-  > logs/gaussian_native_v12_segrap2023_seed2026.log 2>&1 &
+  > logs/gaussian_native_v13_segrap2023_seed2026.log 2>&1 &
 ```
 
 Head-Neck-CBCT-CT:
@@ -117,13 +117,13 @@ Head-Neck-CBCT-CT:
 ```bash
 nohup env CUDA_VISIBLE_DEVICES=0 \
   /home/student3/miniconda3/envs/SACB/bin/python train_gaussian_native.py \
-  --config configs/gaussian_native_v12_head_neck_cbct_ct.json \
+  --config configs/gaussian_native_v13_head_neck_cbct_ct.json \
   --data-root /home/student3/data2t/TouJing/Head-Neck-CBCT-CT_gaussian_native_preprocessed \
   --train-manifest /home/student3/data2t/TouJing/Head-Neck-CBCT-CT_gaussian_native_preprocessed/manifests/train.csv \
   --validation-manifest /home/student3/data2t/TouJing/Head-Neck-CBCT-CT_gaussian_native_preprocessed/manifests/validation.csv \
-  --output-dir runs/gaussian_native_v12_head_neck_cbct_ct_seed2026 \
+  --output-dir runs/gaussian_native_v13_head_neck_cbct_ct_seed2026 \
   --device cuda:0 \
-  > logs/gaussian_native_v12_head_neck_cbct_ct_seed2026.log 2>&1 &
+  > logs/gaussian_native_v13_head_neck_cbct_ct_seed2026.log 2>&1 &
 ```
 
 ## 3. Test-set evaluation
@@ -133,20 +133,20 @@ HaN-Seg and SegRap use `best_validation_dice.pt`:
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/student3/miniconda3/envs/SACB/bin/python \
   evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v12_han_seg_seed2026/best_validation_dice.pt \
+  --checkpoint runs/gaussian_native_v13_han_seg_seed2026/best_validation_dice.pt \
   --data-root /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed \
   --manifest /home/student3/data2t/TouJing/HaN-Seg_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v12_han_seg_test \
+  --output-dir results/gaussian_native_v13_han_seg_test \
   --device cuda:0
 ```
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/student3/miniconda3/envs/SACB/bin/python \
   evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v12_segrap2023_seed2026/best_validation_dice.pt \
+  --checkpoint runs/gaussian_native_v13_segrap2023_seed2026/best_validation_dice.pt \
   --data-root /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed \
   --manifest /home/student3/data2t/TouJing/SegRap2023_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v12_segrap2023_test \
+  --output-dir results/gaussian_native_v13_segrap2023_test \
   --device cuda:0
 ```
 
@@ -155,10 +155,10 @@ CBCT-CT uses `best_validation_ncc.pt` and intentionally emits no Dice fields:
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/student3/miniconda3/envs/SACB/bin/python \
   evaluate_gaussian_native.py \
-  --checkpoint runs/gaussian_native_v12_head_neck_cbct_ct_seed2026/best_validation_ncc.pt \
+  --checkpoint runs/gaussian_native_v13_head_neck_cbct_ct_seed2026/best_validation_ncc.pt \
   --data-root /home/student3/data2t/TouJing/Head-Neck-CBCT-CT_gaussian_native_preprocessed \
   --manifest /home/student3/data2t/TouJing/Head-Neck-CBCT-CT_gaussian_native_preprocessed/manifests/test.csv \
-  --output-dir results/gaussian_native_v12_head_neck_cbct_ct_test \
+  --output-dir results/gaussian_native_v13_head_neck_cbct_ct_test \
   --device cuda:0
 ```
 

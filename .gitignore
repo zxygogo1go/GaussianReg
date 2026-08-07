@@ -9,6 +9,9 @@ findings.md
 progress.md
 .planning/
 
+# Local Codex drawing/PPT render workspaces
+.codex_tmp/
+
 venv/
 .idea/
 原论文.pdf

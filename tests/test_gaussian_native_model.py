@@ -38,6 +38,48 @@ def small_config():
 
 
 class GaussianNativeModelTests(unittest.TestCase):
+    def test_v13_end_to_end_composition_and_backward(self):
+        config = small_config()
+        config["model"].update(
+            {
+                "architecture_revision": "gaussian_native_v13",
+                "geometry_mode": "anchored",
+                "transport_mode": "unbalanced_sinkhorn",
+                "marginal_relaxation": 0.9,
+                "mutual_transport": True,
+                "refinement_factors": [8, 4, 2, 1],
+                "refinement_channels": [8, 8, 8, 8],
+                "refinement_blocks_per_stage": [1, 1, 1, 1],
+                "refinement_maximum_residual_vox": [1.0, 1.0, 1.0, 0.5],
+                "small_organ_selected_parents": 4,
+                "small_organ_children_per_parent": 9,
+                "small_organ_descriptor_dim": 8,
+                "small_organ_hidden_dim": 16,
+                "small_organ_raster_chunk": 4,
+            }
+        )
+        model = build_model(config)
+        moving = torch.rand(1, 1, 32, 32, 32)
+        fixed = torch.rand_like(moving)
+        output = model(moving, fixed, return_aux=True)
+        small = output["small_organ_refinement"]
+        self.assertEqual(tuple(output["flow"].shape), (1, 3, 32, 32, 32))
+        self.assertEqual(float(small["local_flow"].abs().max()), 0.0)
+        self.assertTrue(
+            torch.allclose(output["flow"], output["global_flow"], atol=1.0e-5)
+        )
+        loss = (output["warped"] - fixed).square().mean()
+        loss = loss + small["priority"].mean()
+        loss.backward()
+        self.assertGreater(
+            float(model.small_organ_refiner.velocity_head[-1].weight.grad.abs().sum()),
+            0.0,
+        )
+        self.assertGreater(
+            float(model.small_organ_refiner.priority_head[-1].weight.grad.abs().sum()),
+            0.0,
+        )
+
     def test_v3_canonical_rasterization_ignores_learned_geometry_drift(self):
         model = build_model(small_config())
         volume = torch.rand(1, 1, 32, 32, 32)

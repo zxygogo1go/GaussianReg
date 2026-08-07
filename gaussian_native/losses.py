@@ -127,6 +127,17 @@ class GaussianNativeObjective(nn.Module):
         self.inverse_weight = float(config.get("inverse_weight", 0.50))
         self.jacobian_weight = float(config.get("jacobian_weight", 0.20))
         self.velocity_energy_weight = float(config.get("velocity_energy_weight", 0.01))
+        self.local_velocity_smoothness_weight = float(
+            config.get("local_velocity_smoothness_weight", 1.0)
+        )
+        self.local_velocity_energy_weight = float(
+            config.get("local_velocity_energy_weight", 1.0)
+        )
+        if (
+            self.local_velocity_smoothness_weight < 0.0
+            or self.local_velocity_energy_weight < 0.0
+        ):
+            raise ValueError("local velocity weights must be nonnegative")
         self.motion_hierarchy_weight = float(
             config.get("motion_hierarchy_weight", 0.0)
         )
@@ -303,6 +314,19 @@ class GaussianNativeObjective(nn.Module):
         inverse_consistency = inverse_residual.square().mean()
         smoothness = velocity_smoothness(velocity)
         energy = velocity.square().mean()
+        local_velocity = output.get("local_residual_velocity_vox")
+        if local_velocity is not None:
+            local_velocity = local_velocity.float()
+            smoothness = (
+                smoothness
+                + self.local_velocity_smoothness_weight
+                * velocity_smoothness(local_velocity)
+            )
+            energy = (
+                energy
+                + self.local_velocity_energy_weight
+                * local_velocity.square().mean()
+            )
         topology = jacobian_barrier(flow, margin=self.jacobian_margin)
         motion_hierarchy = self._motion_hierarchy(output)
         return (

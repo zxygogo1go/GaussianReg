@@ -16,6 +16,9 @@ from torch.utils.data import DataLoader
 
 from dataset.head_neck import HeadNeckRegistrationDataset, manifest_sha256
 from gaussian_native.integration import ScalingAndSquaring, warp_tensor
+from gaussian_native.small_organ_refinement import (
+    sample_volume_at_physical_points,
+)
 from experiment_utils import (
     atomic_torch_save,
     build_model,
@@ -604,6 +607,51 @@ def _segmentation_channels(
     return segmentation.float().clamp(0.0, 1.0)
 
 
+def _ordered_label_union(*groups: Sequence[int]) -> tuple[int, ...]:
+    """Return a stable union without changing the configured label order."""
+    result = []
+    seen = set()
+    for group in groups:
+        for value in group:
+            label = int(value)
+            if label <= 0:
+                raise ValueError("training labels must be positive")
+            if label not in seen:
+                result.append(label)
+                seen.add(label)
+    return tuple(result)
+
+
+def _select_loaded_labels(
+    segmentation: torch.Tensor,
+    response_valid: torch.Tensor,
+    loaded_labels: Sequence[int],
+    requested_labels: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select one loss-specific label subset from loaded training channels."""
+    loaded = tuple(int(value) for value in loaded_labels)
+    requested = tuple(int(value) for value in requested_labels)
+    if response_valid.ndim != 2 or response_valid.shape[1] != len(loaded):
+        raise AssertionError(
+            "response_valid must match the loaded training label union"
+        )
+    source_index = {label: index for index, label in enumerate(loaded)}
+    missing = [label for label in requested if label not in source_index]
+    if missing:
+        raise ValueError("requested labels were not loaded: %s" % missing)
+    indices = [source_index[label] for label in requested]
+    valid = response_valid[:, indices]
+    if int(segmentation.shape[1]) == 1:
+        channels = _segmentation_channels(segmentation, requested)
+    else:
+        if int(segmentation.shape[1]) != len(loaded):
+            raise AssertionError(
+                "binary segmentation channels must match loaded labels"
+            )
+        channels = segmentation[:, indices].float().clamp(0.0, 1.0)
+    return channels, valid
+
+
 def _warp_segmentation_channels(
     segmentation: torch.Tensor,
     flow: torch.Tensor,
@@ -630,19 +678,29 @@ def _supervised_anatomy_loss(
     fixed_seg: torch.Tensor,
     response_valid: torch.Tensor,
     config: Mapping[str, object],
+    loaded_labels: Optional[Sequence[int]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Response-aware multi-scale Dice and final-boundary supervision."""
     labels = tuple(int(value) for value in config.get("labels", (1, 2)))
     if not labels:
         raise ValueError("supervised anatomy requires at least one label")
-    valid = response_valid.to(
+    loaded = labels if loaded_labels is None else tuple(loaded_labels)
+    moving_one_hot, valid = _select_loaded_labels(
+        moving_seg,
+        response_valid,
+        loaded,
+        labels,
+    )
+    fixed_one_hot, fixed_valid = _select_loaded_labels(
+        fixed_seg,
+        response_valid,
+        loaded,
+        labels,
+    )
+    valid = (valid & fixed_valid).to(
         device=output["flow"].device,
         dtype=torch.bool,
     )
-    if valid.ndim != 2 or valid.shape[1] != len(labels):
-        raise AssertionError(
-            "response_valid must have shape [B, number_of_labels]"
-        )
     configured_label_weights = tuple(
         float(value)
         for value in config.get(
@@ -661,10 +719,10 @@ def _supervised_anatomy_loss(
         configured_label_weights,
         dtype=torch.float32,
     )
-    moving_one_hot = _segmentation_channels(moving_seg, labels)
-    fixed_one_hot = _segmentation_channels(fixed_seg, labels)
     stage_flows = list(output.get("pyramid_flow", ()))
-    if (
+    if output.get("small_organ_refinement") is not None:
+        flows = stage_flows + [output["flow"]]
+    elif (
         stage_flows
         and tuple(stage_flows[-1].shape[2:])
         == tuple(output["flow"].shape[2:])
@@ -760,6 +818,138 @@ def _supervised_anatomy_loss(
     }
 
 
+def _small_organ_priority_loss(
+    output: Mapping[str, object],
+    fixed_seg: torch.Tensor,
+    response_valid: torch.Tensor,
+    config: Mapping[str, object],
+    loaded_labels: Sequence[int],
+) -> Dict[str, torch.Tensor]:
+    """Teach Gaussian selection with labels that never enter model.forward."""
+    small = output.get("small_organ_refinement")
+    zero = output["flow"].new_zeros((), dtype=torch.float32)
+    if small is None or not bool(config.get("enabled", False)):
+        return {
+            "small_organ_priority": zero,
+            "small_organ_priority_bce": zero,
+            "small_organ_priority_dice": zero,
+            "small_organ_priority_target_fraction": zero,
+            "small_organ_selected_target_fraction": zero,
+            "small_organ_selected_target_recall": zero,
+        }
+    labels = tuple(
+        int(value)
+        for value in config.get("supervision_labels", ())
+    )
+    if not labels:
+        raise ValueError(
+            "enabled small-organ refinement requires supervision_labels"
+        )
+    channels, valid = _select_loaded_labels(
+        fixed_seg,
+        response_valid,
+        loaded_labels,
+        labels,
+    )
+    valid = valid.to(device=channels.device, dtype=torch.bool)
+    valid_channels = channels.float() * valid.to(channels.dtype).view(
+        channels.shape[0],
+        channels.shape[1],
+        1,
+        1,
+        1,
+    )
+    target_volume = valid_channels.amax(dim=1, keepdim=True)
+    kernel = tuple(
+        int(value)
+        for value in config.get("_priority_dilation_kernel", (1, 1, 1))
+    )
+    if len(kernel) != 3 or any(value <= 0 or value % 2 == 0 for value in kernel):
+        raise ValueError("priority dilation kernel must contain three positive odd values")
+    if max(kernel) > 1:
+        target_volume = F.max_pool3d(
+            target_volume,
+            kernel_size=kernel,
+            stride=1,
+            padding=tuple(value // 2 for value in kernel),
+        )
+    centers_mm = output["fixed_decomposition"]["levels"][-1].centers_mm
+    extent_mm = output["fixed_decomposition"]["extent_mm"]
+    target = sample_volume_at_physical_points(
+        target_volume,
+        centers_mm,
+        extent_mm,
+    ).squeeze(-1).clamp(0.0, 1.0)
+    valid_batch = valid.any(dim=1).to(target.dtype)
+    logits = small["priority_logits"].float()
+    if logits.shape != target.shape:
+        raise AssertionError("priority logits and sampled label target must match")
+    positive = target.sum(dim=1)
+    negative = float(target.shape[1]) - positive
+    positive_weight = (negative / positive.clamp_min(1.0)).clamp(1.0, 20.0)
+    bce_per_node = -(
+        positive_weight.unsqueeze(1)
+        * target
+        * F.logsigmoid(logits)
+        + (1.0 - target) * F.logsigmoid(-logits)
+    )
+    bce_per_batch = bce_per_node.mean(dim=1)
+    bce = (
+        (bce_per_batch * valid_batch).sum()
+        / valid_batch.sum().clamp_min(1.0)
+    )
+    probability = torch.sigmoid(logits)
+    numerator = 2.0 * (probability * target).sum(dim=1) + 1.0e-5
+    denominator = (
+        probability.square().sum(dim=1)
+        + target.square().sum(dim=1)
+        + 1.0e-5
+    )
+    dice_per_batch = 1.0 - numerator / denominator
+    dice = (
+        (dice_per_batch * valid_batch).sum()
+        / valid_batch.sum().clamp_min(1.0)
+    )
+    selected_target = _batch_priority_target(
+        target,
+        small["selected_parent_indices"],
+    )
+    target_fraction = (
+        (target.mean(dim=1) * valid_batch).sum()
+        / valid_batch.sum().clamp_min(1.0)
+    )
+    selected_fraction = (
+        (selected_target.mean(dim=1) * valid_batch).sum()
+        / valid_batch.sum().clamp_min(1.0)
+    )
+    selected_recall_per_batch = (
+        selected_target.sum(dim=1)
+        / target.sum(dim=1).clamp_min(1.0)
+    ).clamp(max=1.0)
+    selected_recall = (
+        (selected_recall_per_batch * valid_batch).sum()
+        / valid_batch.sum().clamp_min(1.0)
+    )
+    return {
+        "small_organ_priority": bce + dice,
+        "small_organ_priority_bce": bce,
+        "small_organ_priority_dice": dice,
+        "small_organ_priority_target_fraction": target_fraction,
+        "small_organ_selected_target_fraction": selected_fraction,
+        "small_organ_selected_target_recall": selected_recall,
+    }
+
+
+def _batch_priority_target(
+    target: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    if target.ndim != 2 or indices.ndim != 2 or target.shape[0] != indices.shape[0]:
+        raise AssertionError("priority target/indices must be [B,N] and [B,K]")
+    batch = torch.arange(target.shape[0], device=target.device).view(-1, 1)
+    return target[batch, indices]
+
+
 def _configure_training_stage(
     model: torch.nn.Module,
     config: Mapping[str, object],
@@ -813,12 +1003,20 @@ def _configure_training_stage(
     if residual_pyramid is not None:
         for parameter in residual_pyramid.parameters():
             parameter.requires_grad_(not gaussian_pretrain)
+    small_organ_refiner = getattr(model, "small_organ_refiner", None)
+    if small_organ_refiner is not None:
+        for parameter in small_organ_refiner.parameters():
+            parameter.requires_grad_(not gaussian_pretrain)
     synthetic_probability = _synthetic_deformation_probability(
         dict(config.get("synthetic_deformation", {})),
         epoch,
     )
     anatomy_factor = _supervised_anatomy_factor(
         dict(config.get("supervised_anatomy", {})),
+        epoch,
+    )
+    small_organ_factor = _supervised_anatomy_factor(
+        dict(config.get("small_organ_refinement", {})),
         epoch,
     )
     if gaussian_pretrain and synthetic_probability >= 1.0:
@@ -833,6 +1031,8 @@ def _configure_training_stage(
         stage_name = "synthetic_deformation_warmup"
     elif synthetic_probability > 0.0:
         stage_name = "joint_with_synthetic_deformation"
+    elif 0.0 < small_organ_factor < 1.0:
+        stage_name = "small_organ_gaussian_ramp"
     elif 0.0 < anatomy_factor < 1.0:
         stage_name = "supervised_pyramid_ramp"
     else:
@@ -841,8 +1041,12 @@ def _configure_training_stage(
         "name": stage_name,
         "velocity_head_trainable": not correspondence_warmup,
         "refinement_trainable": not gaussian_pretrain,
+        "small_organ_refinement_trainable": bool(
+            small_organ_refiner is not None and not gaussian_pretrain
+        ),
         "synthetic_deformation_probability": synthetic_probability,
         "supervised_anatomy_factor": anatomy_factor,
+        "small_organ_refinement_factor": small_organ_factor,
         "trainable_parameters": sum(
             parameter.numel()
             for parameter in model.parameters()
@@ -866,6 +1070,9 @@ def _train_epoch(
     synthetic_probability: float,
     supervised_anatomy: Mapping[str, object],
     supervised_anatomy_factor: float,
+    small_organ_refinement: Mapping[str, object],
+    small_organ_refinement_factor: float,
+    training_labels: Sequence[int],
     gradient_clip: float,
     epoch: int,
     log_every: int,
@@ -894,6 +1101,12 @@ def _train_epoch(
     supervised_enabled = bool(
         supervised_anatomy.get("enabled", False)
     )
+    small_organ_enabled = bool(
+        small_organ_refinement.get("enabled", False)
+    )
+    label_training_enabled = bool(
+        supervised_enabled or small_organ_enabled
+    )
     supervised_dice_weight = float(
         supervised_anatomy.get("dice_loss_weight", 0.0)
     )
@@ -909,14 +1122,19 @@ def _train_epoch(
             0.0,
         )
     )
+    small_organ_priority_weight = float(
+        small_organ_refinement.get("priority_loss_weight", 0.0)
+    )
     if (
         supervised_anatomy_factor < 0.0
+        or small_organ_refinement_factor < 0.0
         or supervised_dice_weight < 0.0
         or supervised_boundary_weight < 0.0
         or supervised_centroid_weight < 0.0
         or supervised_inverse_weight < 0.0
+        or small_organ_priority_weight < 0.0
     ):
-        raise ValueError("invalid supervised anatomy weights")
+        raise ValueError("invalid supervised anatomy or SAGR weights")
     spacing_dhw = getattr(model, "spacing_dhw", None)
     if synthetic_probability > 0.0 and spacing_dhw is None:
         raise ValueError(
@@ -928,20 +1146,20 @@ def _train_epoch(
         fixed = sample["fixed"].to(device, non_blocking=True)
         moving_seg = (
             sample["moving_seg"].to(device, non_blocking=True)
-            if supervised_enabled
+            if label_training_enabled
             else None
         )
         fixed_seg = (
             sample["fixed_seg"].to(device, non_blocking=True)
-            if supervised_enabled
+            if label_training_enabled
             else None
         )
         response_valid = (
             sample["response_valid"].to(device, non_blocking=True)
-            if supervised_enabled
+            if label_training_enabled
             else None
         )
-        if supervised_enabled:
+        if label_training_enabled:
             moving, fixed, moving_seg, fixed_seg = (
                 _augment_pair_with_segmentations(
                     moving,
@@ -1013,6 +1231,7 @@ def _train_epoch(
                     fixed_seg,
                     response_valid,
                     supervised_anatomy,
+                    loaded_labels=training_labels,
                 )
             else:
                 supervised_terms = {
@@ -1026,6 +1245,28 @@ def _train_epoch(
                     "supervised_valid_classes": zero,
                 }
             terms.update(supervised_terms)
+            if small_organ_enabled and target_flow is None:
+                if fixed_seg is None or response_valid is None:
+                    raise AssertionError(
+                        "SAGR priority batch is missing fixed segmentations"
+                    )
+                small_organ_terms = _small_organ_priority_loss(
+                    output,
+                    fixed_seg,
+                    response_valid,
+                    small_organ_refinement,
+                    training_labels,
+                )
+            else:
+                small_organ_terms = {
+                    "small_organ_priority": zero,
+                    "small_organ_priority_bce": zero,
+                    "small_organ_priority_dice": zero,
+                    "small_organ_priority_target_fraction": zero,
+                    "small_organ_selected_target_fraction": zero,
+                    "small_organ_selected_target_recall": zero,
+                }
+            terms.update(small_organ_terms)
             terms["total"] = (
                 terms["total"]
                 + synthetic_flow_weight * terms["synthetic_flow"]
@@ -1042,6 +1283,9 @@ def _train_epoch(
                     + supervised_inverse_weight
                     * terms["supervised_inverse_dice"]
                 )
+                + small_organ_refinement_factor
+                * small_organ_priority_weight
+                * terms["small_organ_priority"]
             )
         if not bool(torch.isfinite(terms["total"]).detach()):
             raise FloatingPointError("non-finite loss for patients %s" % list(sample["patient_id"]))
@@ -1620,10 +1864,31 @@ def main(expected_architecture: str = "gaussian_native") -> None:
         int(value)
         for value in supervised_anatomy.get("labels", (1, 2))
     )
+    small_organ_refinement = dict(
+        config.get("small_organ_refinement", {})
+    )
+    small_organ_enabled = bool(
+        small_organ_refinement.get("enabled", False)
+    )
+    small_organ_labels = tuple(
+        int(value)
+        for value in small_organ_refinement.get(
+            "supervision_labels",
+            (),
+        )
+    )
+    training_labels = _ordered_label_union(
+        supervised_labels if supervised_enabled else (),
+        small_organ_labels if small_organ_enabled else (),
+    )
     evaluation_labels = configured_evaluation_labels(config)
     if supervised_enabled and not supervised_labels:
         raise ValueError("supervised anatomy requires at least one label")
-    if supervised_enabled and float(
+    if small_organ_enabled and not small_organ_labels:
+        raise ValueError(
+            "enabled small-organ refinement requires supervision_labels"
+        )
+    if (supervised_enabled or small_organ_enabled) and float(
         augmentation.get("reverse_pair_probability", 0.0)
     ) > 0.0:
         raise ValueError(
@@ -1632,12 +1897,30 @@ def main(expected_architecture: str = "gaussian_native") -> None:
         )
     data_config = dict(config.get("data", {}))
     shape = tuple(int(value) for value in data_config.get("shape_dhw", (128, 160, 160)))
+    spacing_values = tuple(
+        float(value)
+        for value in data_config.get("spacing_dhw", (1.5, 1.5, 1.5))
+    )
+    if len(spacing_values) != 3 or min(spacing_values) <= 0.0:
+        raise ValueError("data.spacing_dhw must contain three positive values")
+    if small_organ_enabled:
+        dilation_mm = float(
+            small_organ_refinement.get("priority_dilation_mm", 6.0)
+        )
+        if dilation_mm < 0.0:
+            raise ValueError("priority_dilation_mm must be nonnegative")
+        small_organ_refinement["_priority_dilation_kernel"] = tuple(
+            2 * int(np.ceil(dilation_mm / spacing)) + 1
+            if dilation_mm > 0.0
+            else 1
+            for spacing in spacing_values
+        )
     train_dataset = HeadNeckRegistrationDataset(
         args.train_manifest,
         args.data_root,
         expected_shape=shape,
-        load_segmentations=supervised_enabled,
-        labels=supervised_labels,
+        load_segmentations=bool(training_labels),
+        labels=training_labels,
     )
     validation_dataset = HeadNeckRegistrationDataset(
         args.validation_manifest,
@@ -1668,6 +1951,10 @@ def main(expected_architecture: str = "gaussian_native") -> None:
     )
 
     model = build_model(config).to(device)
+    if small_organ_enabled and getattr(model, "small_organ_refiner", None) is None:
+        raise ValueError(
+            "small_organ_refinement.enabled requires an enabled V13 SAGR model"
+        )
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     architecture_revision = getattr(
         model,
@@ -1862,6 +2149,11 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 ),
                 supervised_anatomy,
                 float(training_stage["supervised_anatomy_factor"]),
+                small_organ_refinement,
+                float(
+                    training_stage["small_organ_refinement_factor"]
+                ),
+                training_labels,
                 gradient_clip,
                 epoch,
                 log_every,
@@ -1884,6 +2176,13 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             train_metrics["refinement_trainable"] = float(
                 bool(training_stage["refinement_trainable"])
             )
+            train_metrics["small_organ_refinement_trainable"] = float(
+                bool(
+                    training_stage[
+                        "small_organ_refinement_trainable"
+                    ]
+                )
+            )
             train_metrics["trainable_parameters_epoch"] = float(
                 training_stage["trainable_parameters"]
             )
@@ -1892,6 +2191,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             )
             train_metrics["supervised_anatomy_factor"] = float(
                 training_stage["supervised_anatomy_factor"]
+            )
+            train_metrics["small_organ_refinement_factor"] = float(
+                training_stage["small_organ_refinement_factor"]
             )
             validation_metrics: Dict[str, float] = {}
             if epoch % validate_every == 0 or epoch == epochs:
@@ -1934,6 +2236,17 @@ def main(expected_architecture: str = "gaussian_native") -> None:
             writer.add_scalar(
                 "optimization/refinement_trainable",
                 float(bool(training_stage["refinement_trainable"])),
+                epoch,
+            )
+            writer.add_scalar(
+                "optimization/small_organ_refinement_trainable",
+                float(
+                    bool(
+                        training_stage[
+                            "small_organ_refinement_trainable"
+                        ]
+                    )
+                ),
                 epoch,
             )
 
@@ -2032,6 +2345,9 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                 "epoch %d complete stage=%s lr=%.3e "
                 "match_temp=%s appearance=%s "
                 "feature_residual=%s sup_factor=%.3f "
+                "sagr_factor=%.3f sagr_priority=%.4f "
+                "sagr_hit=%.4f sagr_recall=%.4f "
+                "sagr_flow=%.5f sagr_gain=%.4f "
                 "train_sup_dice_loss=%.4f train_sup_boundary=%.4f "
                 "train_sup_centroid=%.4f train_sup_inverse=%.4f "
                 "val_ncc=%s "
@@ -2058,6 +2374,41 @@ def main(expected_architecture: str = "gaussian_native") -> None:
                         training_stage[
                             "supervised_anatomy_factor"
                         ]
+                    ),
+                    float(
+                        training_stage[
+                            "small_organ_refinement_factor"
+                        ]
+                    ),
+                    float(
+                        train_metrics.get(
+                            "small_organ_priority",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "small_organ_selected_target_fraction",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "small_organ_selected_target_recall",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "small_organ_local_flow_abs_vox",
+                            float("nan"),
+                        )
+                    ),
+                    float(
+                        train_metrics.get(
+                            "small_organ_direct_gain",
+                            float("nan"),
+                        )
                     ),
                     float(
                         train_metrics.get(
